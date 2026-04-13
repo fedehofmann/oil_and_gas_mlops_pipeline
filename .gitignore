@@ -1,0 +1,9 @@
+mlruns/
+feature_store/data/
+feature_store/registry/
+feature_store/online_store/
+logs/
+__pycache__/
+*.pyc
+.env
+.DS_Store
