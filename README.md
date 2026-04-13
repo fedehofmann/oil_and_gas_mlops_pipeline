@@ -326,7 +326,7 @@ Para cada pozo, se genera una fila extra con fecha del próximo mes y sin target
 
 ## DAG: `ml_pipeline_oil_and_gas`
 
-El DAG orquesta todo el pipeline. Se puede triggerear desde la UI de Airflow con parámetros opcionales `date_from` y `date_to` para filtrar el dataset por rango de fechas, lo que permite reproducir el entrenamiento para cualquier fecha histórica con un solo comando.
+El DAG orquesta todo el pipeline. Corre automáticamente el **primer día de cada mes** (`schedule="0 0 1 * *"`), alineado con la frecuencia natural del dataset (producción mensual por pozo). También se puede triggerear manualmente desde la UI de Airflow con parámetros opcionales `date_from` y `date_to` para filtrar el dataset por rango de fechas, lo que permite reproducir el entrenamiento para cualquier fecha histórica con un solo comando.
 
 ### Flujo de tasks
 
@@ -453,25 +453,25 @@ Devuelve el pronóstico de producción de un pozo para el próximo mes.
 | `target` | string | NO | `"gas"` (default) o `"pet"` |
 
 **Funcionamiento:**
-1. Consulta el online store de Feast para obtener los features más recientes del pozo
-2. Selecciona el modelo en producción según el target: `oil_gas_prod_gas@production` o `oil_gas_prod_pet@production`
-3. Predice y devuelve el resultado
+1. Genera el rango mensual entre `date_start` y `date_end` (primer día de cada mes)
+2. Para cada fecha del rango, elige la fuente de features:
+   - **Fecha dentro del parquet (histórica):** usa los features reales del offline store. `avg_prod_10m` fue calculado con `shift(1)` en `prepare_offline_store`, por lo que no contiene información de la fecha consultada ni de fechas posteriores (sin leakage)
+   - **Fecha futura (posterior al último dato del parquet):** usa los features del online store (estado más reciente del pozo). El modelo predice un solo paso; se repite la misma predicción para todos los meses futuros sin actualización autoregresiva, para evitar distribution shift en `avg_prod_10m`
+3. Devuelve un punto por cada mes del rango
 
 **Ejemplo de respuesta:**
 ```json
 {
   "id_well": "3640",
-  "target": "gas",
   "data": [
-    {
-      "date": "2017-02-01",
-      "prod": 498.94
-    }
+    { "date": "2023-10-01", "prod": 312.45 },
+    { "date": "2023-11-01", "prod": 298.10 },
+    { "date": "2023-12-01", "prod": 298.10 }
   ]
 }
 ```
 
-**Decisión de diseño:** Para la entrega parcial se devuelve solo el próximo mes disponible independientemente del rango solicitado. Esto está documentado en el swagger.
+**Decisión de diseño — predicción autoregresiva descartada:** Actualizar `avg_prod_10m` con valores predichos introduce distribution shift (el feature fue calculado sobre producción real en entrenamiento). En pozos shale con decline pronunciado, el error se autocorrela. La alternativa de repetir la misma predicción para fechas futuras es más honesta respecto a las limitaciones del modelo single-step.
 
 ### `GET /api/v1/wells`
 
