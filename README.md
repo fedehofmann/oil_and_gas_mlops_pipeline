@@ -1,4 +1,4 @@
-# TP Final - IA en Producción: Pipeline de Pronóstico de Producción de Hidrocarburos
+# TP Inteligencia Artificial En Producción - Pipeline De Pronóstico De Producción De Hidrocarburos
 
 ## Descripción
 
@@ -84,8 +84,8 @@ __pycache__/
 Crear un archivo `.env` en la raíz del proyecto con el siguiente contenido:
 
 ```
-AIRFLOW_UID=501
-_PIP_ADDITIONAL_REQUIREMENTS=pandas scikit-learn mlflow feast fastapi uvicorn==0.40.0
+AIRFLOW_UID = 501
+_PIP_ADDITIONAL_REQUIREMENTS = pandas scikit-learn mlflow feast fastapi uvicorn==0.40.0
 ```
 
 > **Nota:** `uvicorn==0.40.0` está pineado para evitar un conflicto de dependencias entre `feast` y `apache-airflow-core 3.1.7`, que requiere `uvicorn>=0.37.0`. Sin este pin, `feast` instala una versión incompatible que rompe el api-server de Airflow.
