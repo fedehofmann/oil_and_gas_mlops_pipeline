@@ -17,7 +17,7 @@ REDUCED_FEATURES_GAS = ['tipoextraccion', 'tef', 'profundidad']
 EXPERIMENTS = [
     # prod_pet: variando n_estimators
     {'target': 'prod_pet', 'model_params': {'n_estimators': 50, 'random_state': 42}, 'features': ALL_FEATURES_PET},
-    {'target': 'prod_pet', 'model_params': {'n_estimators': 200, 'random_state': 42}, 'features': ALL_FEATURES_PET},
+    {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': ALL_FEATURES_PET},
     # prod_pet: limitando profundidad del árbol
     {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 5}, 'features': ALL_FEATURES_PET},
     {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 10}, 'features': ALL_FEATURES_PET},
@@ -25,7 +25,7 @@ EXPERIMENTS = [
     {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': REDUCED_FEATURES_PET},
     # prod_gas: variando n_estimators
     {'target': 'prod_gas', 'model_params': {'n_estimators': 50, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
-    {'target': 'prod_gas', 'model_params': {'n_estimators': 200, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
+    {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
     # prod_gas: limitando profundidad
     {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 5}, 'features': ALL_FEATURES_GAS},
     {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 10}, 'features': ALL_FEATURES_GAS},
@@ -93,10 +93,9 @@ def ml_pipeline():
     columns = ['idpozo', 'fecha', 'prod_pet', 'prod_gas', 'tipoextraccion', 'profundidad', 'tef', 'prod_agua']
 
     # En tercer lugar filtramos las columnas, dropeamos nulos y ordenamos ascendentemente para calcular las nuevas variables explicativas
+    # El filtro de fechas se aplica DESPUÉS del cálculo de features para preservar el contexto histórico del rolling
     df = (df[columns]
           .dropna()
-          .pipe(lambda df: df[df['fecha'] >= date_from] if date_from else df) # Filtra desde date_from si se especificó
-          .pipe(lambda df: df[df['fecha'] <= date_to] if date_to else df) # Filtra hasta date_to si se especificó
           .sort_values(['idpozo', 'fecha'])
           .reset_index(drop = True)
           )
@@ -118,6 +117,13 @@ def ml_pipeline():
         # Cuántas lecturas lleva el pozo hasta este momento
         n_readings = lambda x: x.groupby('idpozo').cumcount() + 1
     )
+
+    # Aplicamos el filtro de fechas DESPUÉS de calcular los features
+    # Así el rolling de la primera fila del rango usa toda la historia disponible, no solo desde date_from
+    if date_from:
+        df = df[df['fecha'] >= date_from].reset_index(drop = True)
+    if date_to:
+        df = df[df['fecha'] <= date_to].reset_index(drop = True)
 
     # Generamos la fila futura por pozo para el online store (sin target)
     future = (df.groupby('idpozo').tail(1).copy()
@@ -168,14 +174,17 @@ def ml_pipeline():
   @task
   def split_data(feature_store_repo):
     """
-    Obtiene los features históricos del offline store via Feast, dropea las filas futuras
-    y divide el dataset en conjuntos de entrenamiento y test para cada target.
+    Obtiene los features históricos del offline store via Feast usando get_historical_features,
+    que hace un point-in-time lookup: para cada par (idpozo, fecha), devuelve los features
+    tal como eran en esa fecha, garantizando que no haya data leakage.
+
+    Después descarta las filas futuras (sin target) y divide en train/test con un split
+    temporal (train = pasado, test = futuro).
 
     Args: feature_store_repo (str) - path al repositorio de Feast.
     Retorna: dict con los paths a los archivos parquet de cada subconjunto (X_train, X_test, y_train, y_test).
     """
     from feast import FeatureStore
-    from sklearn.model_selection import train_test_split
 
     # Leemos el parquet para obtener las llaves de entidades
     offline_parquet_path = os.path.join(feature_store_repo, 'data/well_features.parquet')
@@ -209,41 +218,43 @@ def ml_pipeline():
     # Dropeamos las filas futuras (prod_gas = None) que agregamos para el online store
     training_df = training_df.dropna(subset = ['prod_gas', 'prod_pet'])
 
-    # Definimos targets y features
-    targets = ['prod_pet', 'prod_gas']
-    X = training_df.drop(columns = targets)
-    y_pet = training_df['prod_pet']
-    y_gas = training_df['prod_gas']
+    # Split temporal: el 80% más antiguo es train, el 20% más reciente es test
+    # Para series de tiempo esto es correcto: el modelo nunca ve datos futuros durante el entrenamiento
+    training_df = training_df.sort_values('event_timestamp').reset_index(drop = True)
+    unique_dates = sorted(training_df['event_timestamp'].unique())
+    cutoff_date = unique_dates[int(len(unique_dates) * 0.8)]
 
-    # Split en subconjuntos de entrenamiento y test para cada target
-    X_train_pet, X_test_pet, y_pet_train, y_pet_test = train_test_split(X, y_pet, test_size = 0.2, random_state = 42)
-    X_train_gas, X_test_gas, y_gas_train, y_gas_test = train_test_split(X, y_gas, test_size = 0.2, random_state = 42)
+    train_df = training_df[training_df['event_timestamp'] <  cutoff_date]
+    test_df  = training_df[training_df['event_timestamp'] >= cutoff_date]
+
+    # X es igual para ambos targets: mismas filas, mismas columnas (sin ID, timestamp ni targets)
+    non_features = ['idpozo', 'event_timestamp', 'prod_pet', 'prod_gas']
+    X_train = train_df.drop(columns = non_features)
+    X_test  = test_df.drop(columns = non_features)
 
     # Creamos la carpeta si no existe y guardamos los splits en disco
     os.makedirs('/opt/airflow/data/splits', exist_ok = True)
 
-    X_train_pet.to_parquet('/opt/airflow/data/splits/X_train_pet.parquet')
-    X_test_pet.to_parquet('/opt/airflow/data/splits/X_test_pet.parquet')
-    X_train_gas.to_parquet('/opt/airflow/data/splits/X_train_gas.parquet')
-    X_test_gas.to_parquet('/opt/airflow/data/splits/X_test_gas.parquet')
+    X_train.to_parquet('/opt/airflow/data/splits/X_train.parquet')
+    X_test.to_parquet('/opt/airflow/data/splits/X_test.parquet')
 
-    y_pet_train.to_frame().to_parquet('/opt/airflow/data/splits/y_pet_train.parquet')
-    y_pet_test.to_frame().to_parquet('/opt/airflow/data/splits/y_pet_test.parquet')
-    y_gas_train.to_frame().to_parquet('/opt/airflow/data/splits/y_gas_train.parquet')
-    y_gas_test.to_frame().to_parquet('/opt/airflow/data/splits/y_gas_test.parquet')
+    train_df[['prod_pet']].to_parquet('/opt/airflow/data/splits/y_pet_train.parquet')
+    test_df[['prod_pet']].to_parquet('/opt/airflow/data/splits/y_pet_test.parquet')
+    train_df[['prod_gas']].to_parquet('/opt/airflow/data/splits/y_gas_train.parquet')
+    test_df[['prod_gas']].to_parquet('/opt/airflow/data/splits/y_gas_test.parquet')
 
     return {
         'prod_pet': {
-            'X_train': '/opt/airflow/data/splits/X_train_pet.parquet',
-            'X_test': '/opt/airflow/data/splits/X_test_pet.parquet',
+            'X_train': '/opt/airflow/data/splits/X_train.parquet',
+            'X_test':  '/opt/airflow/data/splits/X_test.parquet',
             'y_train': '/opt/airflow/data/splits/y_pet_train.parquet',
-            'y_test': '/opt/airflow/data/splits/y_pet_test.parquet',
+            'y_test':  '/opt/airflow/data/splits/y_pet_test.parquet',
         },
         'prod_gas': {
-            'X_train': '/opt/airflow/data/splits/X_train_gas.parquet',
-            'X_test': '/opt/airflow/data/splits/X_test_gas.parquet',
+            'X_train': '/opt/airflow/data/splits/X_train.parquet',
+            'X_test':  '/opt/airflow/data/splits/X_test.parquet',
             'y_train': '/opt/airflow/data/splits/y_gas_train.parquet',
-            'y_test': '/opt/airflow/data/splits/y_gas_test.parquet',
+            'y_test':  '/opt/airflow/data/splits/y_gas_test.parquet',
         }
     }
   @task
@@ -268,7 +279,7 @@ def ml_pipeline():
 
       # Leemos los subconjuntos de train filtrando solo las features del experimento
       X_train = pd.read_parquet(splits.get(target).get('X_train'))[features]
-      y_train = pd.read_parquet(splits.get(target).get('y_train'))
+      y_train = pd.read_parquet(splits.get(target).get('y_train')).squeeze()
 
       # Creamos el modelo con los hiperparámetros del experimento
       # Random Forest construye N árboles de decisión, cada uno entrenado con una muestra aleatoria distinta de los datos y un subconjunto aleatorio de features
@@ -316,7 +327,7 @@ def ml_pipeline():
 
     # Leemos los subconjuntos de train y test
     X_test = pd.read_parquet(splits.get(results['target']).get('X_test'))[features]
-    y_test = pd.read_parquet(splits.get(results['target']).get('y_test'))
+    y_test = pd.read_parquet(splits.get(results['target']).get('y_test')).squeeze()
 
     # Cargamos el modelo
     loaded_model = pickle.load(open(results['model_path'], 'rb'))
@@ -336,8 +347,8 @@ def ml_pipeline():
     mlflow.set_experiment('ml_pipeline_oil_and_gas')
 
     with mlflow.start_run(run_name = run_name): # Abrimos un nuevo run con ese nombre
-        mlflow.sklearn.autolog() # Logueamos automáticamente parámetros del modelo (hiperparámetros, etc.)
         mlflow.log_param('target', results['target']) # Logueamos manualmente el target para filtrar en la UI
+        mlflow.log_params(results['model_params']) # Logueamos los hiperparámetros del experimento
         mlflow.log_metric('mae', mae) # Métricas de evaluación
         mlflow.log_metric('mse', mse)
         mlflow.log_metric('rmse', rmse)

@@ -289,14 +289,16 @@ Lee el CSV, aplica todas las transformaciones y genera el parquet del offline st
 **Transformaciones en orden:**
 1. Construye la columna `fecha` a partir de `anio` y `mes`
 2. Selecciona las columnas relevantes y dropea nulos
-3. Filtra por `date_from` y `date_to` si se especificaron (usando `.pipe()` para mantener el method chaining)
-4. Encodea `tipoextraccion` con `LabelEncoder` (texto → número)
-5. Calcula los features de ventana con pandas vectorizado (`groupby + rolling + shift`)
+3. Encodea `tipoextraccion` con `LabelEncoder` (texto → número)
+4. Calcula los features de ventana con pandas vectorizado (`groupby + rolling + shift`) sobre el **dataset completo**
+5. **Aplica el filtro de fechas** (`date_from` / `date_to`) recién aquí, después de los features
 6. Genera la fila futura por pozo para el online store
 7. Guarda el parquet en `/opt/airflow/feature_store/data/well_features.parquet`
 8. Ejecuta `feast apply` para registrar el parquet en el registry de Feast
 
-**Decisión de diseño:** Se usa pandas vectorizado (`groupby + rolling`) en lugar de un loop por pozo. Esto es más eficiente porque pandas procesa todas las filas en paralelo internamente, evitando la sobrecarga de iterar fila por fila en Python.
+**Decisión de diseño — orden del filtro de fechas:** El filtro se aplica *después* del cálculo de features para evitar data leakage. Si se filtrara primero, el rolling de la primera fila del rango solo tendría contexto desde `date_from`, perdiendo todo el historial anterior. Por ejemplo, si se entrena con datos desde 2021, el `avg_prod_gas_10m` de enero 2021 igual refleja los 10 meses previos (2020), no solo los datos del rango de entrenamiento.
+
+**Decisión de diseño — pandas vectorizado:** Se usa `groupby + rolling` en lugar de un loop por pozo. Pandas procesa todas las filas internamente sin iterar en Python puro, lo que es significativamente más eficiente con datasets de cientos de miles de filas.
 
 ### Task 3: `populate_online_store`
 
@@ -306,9 +308,11 @@ Lee el parquet, se queda con la última fila de cada pozo (la fila futura sin ta
 
 ### Task 4: `split_data`
 
-Obtiene los features históricos del offline store via Feast usando `get_historical_features`, que hace un **point-in-time lookup**: para cada fila del `entity_df`, busca los features tal como eran en esa fecha, evitando data leakage.
+Obtiene los features históricos del offline store via Feast usando `get_historical_features`, que hace un **point-in-time lookup**: para cada par `(idpozo, fecha)`, devuelve los features tal como eran en esa fecha exacta, garantizando que no hay data leakage entre el pasado y el futuro.
 
-Después dropea las filas futuras (`prod_gas = None`), define `X` e `y` para cada target, y splitea en train/test con `random_state=42` para reproducibilidad.
+Después descarta las filas futuras (`prod_gas = None`) y divide en train/test con un **split temporal**.
+
+**Decisión de diseño — split temporal en lugar de split aleatorio:** Para series de tiempo, un split aleatorio introduce data leakage: el modelo podría entrenarse con datos de 2023 para predecir datos de 2020. El split temporal garantiza que el modelo solo ve datos pasados durante el entrenamiento. Se usa el 80% de fechas más antiguas como train y el 20% más reciente como test.
 
 **Por qué el split se hace acá y no en `train_model`:** Todos los experimentos se evalúan sobre el mismo conjunto de test. Si el split se hiciera dentro de cada `train_model`, cada experimento podría tener un test set distinto y las métricas no serían comparables.
 
@@ -428,7 +432,35 @@ El modelo con mejor `r2` por target queda taggeado con el alias `production` en 
 
 Desde la UI de Airflow en http://localhost:8080, triggerear el DAG `ml_pipeline_oil_and_gas` con los parámetros:
 
-- `date_from`: fecha de inicio del dataset (opcional, formato `YYYY-MM-DD`)
-- `date_to`: fecha de fin del dataset (opcional, formato `YYYY-MM-DD`)
+- `date_from`: fecha de inicio del rango de entrenamiento (formato `YYYY-MM-DD`)
+- `date_to`: fecha de fin del rango de entrenamiento (formato `YYYY-MM-DD`)
 
-Si no se especifican fechas, se usa el dataset completo.
+**Rango recomendado para entornos locales:** `date_from=2023-01-01`, `date_to=2023-12-31`.
+
+**Decisión de diseño — elección del rango de fechas:** Se recomienda este rango por dos razones:
+
+1. **Restricción de memoria en entornos locales:** `get_historical_features` de Feast carga el parquet completo en memoria para resolver el point-in-time join. Con 9 contenedores corriendo, el worker de Airflow dispone de ~1.5-2GB libres, insuficientes para datasets de más de un año. En producción, con un backend distribuido para Feast (BigQuery, Spark), se utilizaría el rango 2021-2023 sin esta limitación. La restricción es del backend local (parquet + SQLite), no de la arquitectura.
+
+2. **Representatividad industrial del rango 2021-2023 en producción:** El año 2020 fue atípico por la caída de demanda energética durante COVID-19. A partir de 2021 la producción no convencional en Vaca Muerta retomó su tendencia de crecimiento sostenido. Además, las técnicas de completación y fractura cambiaron radicalmente entre 2012 y 2021 (de 1.500 a 2.500 lb de proppant por pie, costos de USD 20M a USD 11M por pozo), por lo que datos de pozos antiguos representan una realidad operativa distinta a la actual e introducen ruido en el modelo. Los features de ventana (`avg_prod_gas_10m`, `last_prod_gas`) igualmente incorporan el historial completo previo a `date_from` gracias al orden de operaciones en `prepare_offline_store`.
+
+**Sustento de la decisión — fuentes:**
+
+*Sobre el impacto de COVID-19 en 2020:*
+- Ben Salah, A. (2025). The Impact of COVID‐19 on Oil and Natural Gas Production. *OPEC Energy Review*. Wiley. https://onlinelibrary.wiley.com/doi/10.1111/opec.12321 — Confirma impacto negativo en producción de petróleo y gas en 14 países productores entre enero 2020 y diciembre 2021.
+- U.S. Energy Information Administration. (2024). *Argentina's crude oil and natural gas production near record highs*. https://www.eia.gov/todayinenergy/detail.php?id=63924 — Reporta que la producción de Vaca Muerta retomó crecimiento sostenido recién a partir de 2021.
+
+*Sobre la madurez de Vaca Muerta a partir de 2021:*
+- Rystad Energy. (2023). *Argentina's Vaca Muerta shale patch could produce 1 million bpd in 2030*. https://www.rystadenergy.com/news/argentina-s-vaca-muerta-shale-patch — Señala que el desarrollo regional se aceleró en 2021 post-COVID y que las proyecciones toman como referencia el desempeño de pozos completados en 2021-2022.
+- OilPrice.com. (2023). *Vaca Muerta's Sweet Crude Attracts Global Energy Giants*. https://oilprice.com/Energy/Crude-Oil/Vaca-Muertas-Sweet-Crude-Attracts-Global-Energy-Giants.html — Para junio 2023, Vaca Muerta producía 296.577 bbl/día de shale oil, un 24% más que el mismo período de 2022.
+
+*Sobre la evolución de técnicas de completación (pozos 2012-2013 no son comparables a 2021+):*
+- Rystad Energy. (2023). Op. cit. — Documenta la adopción de la filosofía "bigger-is-better": de 1.500 a 2.500 lb de proppant por pie y reducción del espaciado entre etapas de 250 a 210 pies entre 2018 y 2022.
+- AAPG Wiki. *Vaca Muerta play*. https://wiki.aapg.org/Vaca_Muerta_play — Costos de completación cayeron de USD 20-25M por pozo (2012) a USD 11-12M (2020) por cambios tecnológicos; los datos de pozos tempranos reflejan una realidad operativa distinta.
+- Pan American Energy. (2021). Applying State-of-the-Art Completion Techniques in Vaca Muerta Formation. *SPE/AAPG/SEG URTC*. https://onepetro.org/URTECONF/proceedings-abstract/21URTC/1-21URTC/D011S007R002/465470
+- Mawad, D. et al. (2023). From Exploration to Development: The Completion Evolution in Vaca Muerta. SPE-212574-MS. https://www.academia.edu/115677720
+
+*Contraargumento considerado — los modelos de decline curve se benefician de historiales largos:*
+- Lei, Z. et al. (2024). Production decline curve analysis of shale oil wells: A case study of Bakken, Eagle Ford and Permian. *ScienceDirect*. https://www.sciencedirect.com/science/article/pii/S1995822624002139 — Pozos con más de 2 años de historial permiten mayor precisión en la estimación del EUR con modelos tipo SEPD + Arps.
+- MDPI Energies. (2024). An Improved Decline Curve Analysis Method via Ensemble Learning for Shale Gas Reservoirs. https://www.mdpi.com/1996-1073/17/23/5910 — El modelo SEPD requiere datos históricos sustanciales para estimar parámetros de decline de forma confiable.
+
+> **Nota:** Este contraargumento es válido para modelos de decline curve clásicos. En este trabajo se usa un modelo de ML supervisado (RandomForest), donde la heterogeneidad tecnológica entre pozos de distintas épocas introduce ruido que puede perjudicar la generalización. Se priorizó la homogeneidad del período de entrenamiento sobre la extensión del historial.
