@@ -38,9 +38,15 @@ EXPERIMENTS = [
 @dag(
     dag_id = 'ml_pipeline_oil_and_gas',
     description = 'Pipeline de Machine Learning con Airflow, MLFlow y Feature Store - Trabajo Práctico Final',
+    schedule = '0 0 1 * *', # Corre el primer día de cada mes a medianoche. El dataset es mensual
+                             # (producción por pozo por mes), por lo que el reentrenamiento mensual
+                             # es la frecuencia natural. En producción con un backend distribuido
+                             # para Feast (BigQuery, Spark), correría sobre el rango completo.
+                             # En entornos locales se recomienda triggear manualmente con date_from
+                             # y date_to para acotar el dataset y evitar OOM.
     params = { # Los params permiten configurar el DAG desde la UI de Airflow sin tocar el código
-        'date_from': Param(default = None, type = ['null', 'string'], description = 'Fecha inicio (YYYY-MM-DD)'),
-        'date_to': Param(default = None, type = ['null', 'string'], description = 'Fecha fin (YYYY-MM-DD)'),
+        'date_from': Param(default = None, type = ['null', 'string'], description = 'Fecha inicio (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
+        'date_to': Param(default = None, type = ['null', 'string'], description = 'Fecha fin (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
     }
 )
 def ml_pipeline():
