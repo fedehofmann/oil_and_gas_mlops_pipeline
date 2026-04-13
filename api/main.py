@@ -45,9 +45,18 @@ def get_wells(date_query: str):
 @app.get("/api/v1/forecast")
 def get_forecast(id_well: str, date_start: str, date_end: str, target: str = "gas"):
     """
-    Devuelve el pronóstico de producción de un pozo dado.
-    Para la entrega parcial se devuelve el próximo mes disponible
-    independientemente del rango solicitado.
+    Devuelve el pronóstico de producción de un pozo para cada mes entre date_start y date_end.
+
+    Estrategia de inferencia según el tipo de fecha:
+    - Fechas dentro del parquet (históricas): se usan los features reales del offline store.
+      avg_prod_10m fue calculado con shift(1) en prepare_offline_store, así que el valor
+      en la fila de fecha T contiene producción de T-10 a T-1 (sin leakage).
+    - Fechas futuras (posteriores al último dato del parquet): se usan los features del online
+      store (estado más reciente del pozo). El modelo predice un solo paso; se repite la misma
+      predicción para todos los meses futuros del rango. No se hace actualización autoregresiva
+      porque alimentar el modelo con sus propias predicciones cambia la distribución de
+      avg_prod_10m respecto al entrenamiento (distribution shift).
+
     Args:
         id_well (str) - identificador del pozo.
         date_start (str) - fecha de inicio en formato YYYY-MM-DD.
@@ -58,62 +67,74 @@ def get_forecast(id_well: str, date_start: str, date_end: str, target: str = "ga
         if target not in ("gas", "pet"):
             raise HTTPException(status_code = 400, detail = "target debe ser 'gas' o 'pet'")
 
-        # Obtenemos los features más recientes del pozo desde el online store
-        store = FeatureStore(repo_path = FEATURE_STORE_REPO)
-        online_features = store.get_online_features(
-            features=[
-                'well_stats:tipoextraccion',
-                'well_stats:avg_prod_gas_10m',
-                'well_stats:avg_prod_pet_10m',
-                'well_stats:last_prod_gas',
-                'well_stats:last_prod_pet',
-                'well_stats:n_readings',
-                'well_stats:profundidad',
-                'well_stats:tef',
-                'well_stats:prod_agua',
-            ],
-            entity_rows = [{"idpozo": int(id_well)}]
-        ).to_df()
-
-        # Verificamos que el pozo existe en el online store
-        if online_features.isnull().all(axis = 1).any():
-            raise HTTPException(status_code = 404, detail = f"No se encontraron features para el pozo {id_well}")
-
-        # Seleccionamos features y modelo según el target
-        # Cada target usa sus propios features de ventana para evitar introducir ruido entre variables que no siempre están correlacionadas
+        # Columnas de features y modelo según el target
+        # Cada target usa sus propios features de ventana para evitar ruido entre variables
+        # que no siempre están correlacionadas (un pozo puede ser gasífero o petrolífero)
         if target == "gas":
-            X = online_features[[
-                'tipoextraccion', 'tef', 'profundidad', 'prod_agua',
-                'avg_prod_gas_10m', 'last_prod_gas', 'n_readings'
-            ]]
-            model = mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production") # alias "production"
-            # Este alias fue asignado por select_best_model al modelo con mejor r2 entre los 5 experimentos entrenados para gas
+            feature_cols = ['tipoextraccion', 'tef', 'profundidad', 'prod_agua',
+                            'avg_prod_gas_10m', 'last_prod_gas', 'n_readings']
+            model = mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")
         else:
-            X = online_features[[
-                'tipoextraccion', 'tef', 'profundidad', 'prod_agua',
-                'avg_prod_pet_10m', 'last_prod_pet', 'n_readings'
-            ]]
-            model = mlflow.sklearn.load_model("models:/oil_gas_prod_pet@production") # alias "production"
-            # Este alias fue asignado por select_best_model al modelo con mejor r2 entre los 5 experimentos entrenados para gas
+            feature_cols = ['tipoextraccion', 'tef', 'profundidad', 'prod_agua',
+                            'avg_prod_pet_10m', 'last_prod_pet', 'n_readings']
+            model = mlflow.sklearn.load_model("models:/oil_gas_prod_pet@production")
 
-        # Predecimos
-        prediction = float(model.predict(X)[0])
+        # Rango mensual (primer día de cada mes)
+        dates = pd.date_range(start = date_start, end = date_end, freq = 'MS')
+        if len(dates) == 0:
+            raise HTTPException(status_code = 400, detail = "date_start debe ser anterior a date_end")
 
-        # Calculamos la fecha del próximo mes disponible
+        # Cargamos el offline store indexado por fecha para el pozo dado
         df = pd.read_parquet(PARQUET_PATH)
         df['fecha'] = pd.to_datetime(df['fecha'])
-        last_date = df[df['idpozo'] == int(id_well)]['fecha'].max()
-        next_date = last_date + pd.DateOffset(months = 1)
+        well_df = df[df['idpozo'] == int(id_well)].set_index('fecha')
+
+        if well_df.empty:
+            raise HTTPException(status_code = 404, detail = f"No se encontraron datos para el pozo {id_well}")
+
+        # Features del online store: se cargan solo si el rango incluye fechas futuras
+        online_X = None
+
+        results = []
+        for date in dates:
+            if date in well_df.index:
+                # Fecha histórica: features reales del offline store.
+                # avg_prod_10m en la fila T = media de prod de T-10 a T-1 (shift(1) aplicado
+                # en prepare_offline_store). No hay leakage.
+                X = well_df.loc[[date], feature_cols]
+            else:
+                # Fecha futura: features del online store (estado más reciente del pozo).
+                # Se reutiliza online_X para todos los meses futuros del rango.
+                if online_X is None:
+                    store = FeatureStore(repo_path = FEATURE_STORE_REPO)
+                    online_features = store.get_online_features(
+                        features=[
+                            'well_stats:tipoextraccion',
+                            'well_stats:avg_prod_gas_10m',
+                            'well_stats:avg_prod_pet_10m',
+                            'well_stats:last_prod_gas',
+                            'well_stats:last_prod_pet',
+                            'well_stats:n_readings',
+                            'well_stats:profundidad',
+                            'well_stats:tef',
+                            'well_stats:prod_agua',
+                        ],
+                        entity_rows = [{"idpozo": int(id_well)}]
+                    ).to_df()
+
+                    if online_features.isnull().all(axis = 1).any():
+                        raise HTTPException(status_code = 404, detail = f"No se encontraron features para el pozo {id_well}")
+
+                    online_X = online_features[feature_cols]
+
+                X = online_X
+
+            pred = max(0.0, float(model.predict(X)[0]))  # floor en 0: producción no puede ser negativa
+            results.append({"date": date.strftime("%Y-%m-%d"), "prod": round(pred, 2)})
 
         return {
             "id_well": id_well,
-            "target": target,
-            "data": [
-                {
-                    "date": next_date.strftime("%Y-%m-%d"),
-                    "prod": prediction
-                }
-            ]
+            "data": results
         }
 
     except HTTPException:
