@@ -56,7 +56,7 @@ def ml_pipeline():
     Args: url (str) - URL de descarga, save_path (str) - ruta local del archivo.
     Retorna: la ruta del archivo guardado.
     """
-    # Creo la carpeta en disco (Docker)
+    # Creamos la carpeta en disco (Docker)
     os.makedirs(os.path.dirname(save_path), exist_ok = True)
 
     df = pd.read_csv(url)
@@ -258,31 +258,31 @@ def ml_pipeline():
       """
       from sklearn.ensemble import RandomForestRegressor
 
-      # Extraigo la configuración del experimento
+      # Extraemos la configuración del experimento
       target = config['target']
       features = config['features']
       model_params = config['model_params']
 
-      # Construyo el path del modelo en base al target y los hiperparámetros
+      # Construimos el path del modelo en base al target y los hiperparámetros
       model_path = f'/opt/airflow/models/model_{target}_{model_params["n_estimators"]}.pkl'
 
-      # Leo los subconjuntos de train filtrando solo las features del experimento
+      # Leemos los subconjuntos de train filtrando solo las features del experimento
       X_train = pd.read_parquet(splits.get(target).get('X_train'))[features]
       y_train = pd.read_parquet(splits.get(target).get('y_train'))
 
-      # Creo el modelo con los hiperparámetros del experimento
+      # Creamos el modelo con los hiperparámetros del experimento
       # Random Forest construye N árboles de decisión, cada uno entrenado con una muestra aleatoria distinta de los datos y un subconjunto aleatorio de features
       # Para predecir, promedia los resultados de todos los árboles
       model = RandomForestRegressor(**model_params)
 
-      # Lo entreno
+      # Lo entrenamos
       model.fit(X_train, y_train)
 
-      # Creo la carpeta si no existe (pickle falla si la carpeta no existe)
+      # Creamos la carpeta si no existe (pickle falla si la carpeta no existe)
       os.makedirs(os.path.dirname(model_path), exist_ok = True)
 
-      # Guardo el modelo en disco en formato binario
-      # Lo que guardo es el objeto modelo completo: todos los árboles con sus reglas de split
+      # Guardamos el modelo en disco en formato binario
+      # Lo que guardamos es el objeto modelo completo: todos los árboles con sus reglas de split
       with open(model_path, 'wb') as f:
           pickle.dump(model, f)
 
@@ -304,25 +304,25 @@ def ml_pipeline():
           splits (dict) - diccionario con paths a cada uno de los subconjuntos de train y test.
     Retorna: None.
     """
-    # Importo métricas de Sickit Learn
+    # Importamos métricas de Sickit Learn
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-    # Importo MLFlow
+    # Importamos MLFlow
     import mlflow
     import mlflow.sklearn
 
-    # Defino las variables que fueron seleccionadas para entrenar (tienen que ser las mismas para no romper)
+    # Definimos las variables que fueron seleccionadas para entrenar (tienen que ser las mismas para no romper)
     features = results['features']
 
-    # Leo los subconjuntos de train y test
+    # Leemos los subconjuntos de train y test
     X_test = pd.read_parquet(splits.get(results['target']).get('X_test'))[features]
     y_test = pd.read_parquet(splits.get(results['target']).get('y_test'))
 
-    # Cargo el modelo
+    # Cargamos el modelo
     loaded_model = pickle.load(open(results['model_path'], 'rb'))
     y_pred = loaded_model.predict(X_test)
 
-    # Calculo métricas en testing
+    # Calculamos métricas en testing
     mae = mean_absolute_error(y_test, y_pred)
     mse = mean_squared_error(y_test, y_pred)
     rmse = mse ** 0.5
@@ -416,7 +416,7 @@ def ml_pipeline():
   # Definimos dependencias iniciales
   start >> csv_path >> offline_store >> online_store >> splits
 
-  # Loopeo sobre los experimentos encadenados en serie
+  # Loop sobre los experimentos encadenados en serie
   prev_task = splits
   for exp in EXPERIMENTS:
       result = train_model(splits = splits, config = exp) # Entrena el modelo con la config del experimento

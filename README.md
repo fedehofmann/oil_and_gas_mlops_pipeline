@@ -2,7 +2,7 @@
 
 ## Descripción
 
-Este proyecto implementa un pipeline completo de Machine Learning en producción para pronosticar la producción de gas y petróleo de pozos no convencionales. El sistema integra Airflow para orquestación, MLflow para tracking de experimentos, Feast como feature store, y una API REST para consumo externo.
+Este proyecto implementa un pipeline completo de Machine Learning en producción para pronosticar la producción de gas y petróleo de pozos no convencionales. El sistema integra Airflow para orquestación, MLFlow para tracking de experimentos, Feast como feature store, y una API REST para consumo externo.
 
 ---
 
@@ -12,25 +12,25 @@ Este proyecto implementa un pipeline completo de Machine Learning en producción
 Dataset (CSV)
     ↓
 Airflow DAG
-    ├── download_dataset        → descarga el CSV
-    ├── prepare_offline_store   → calcula features y genera el parquet + feast apply
-    ├── populate_online_store   → materializa features recientes al SQLite
-    ├── split_data              → obtiene features del feature store y splitea
-    ├── train_model (x N)       → entrena experimentos en serie
-    ├── evaluate_model (x N)    → evalúa y loguea en MLflow
-    └── select_best_model       → promueve el mejor modelo a producción
+    ├── download_dataset → descarga el CSV
+    ├── prepare_offline_store → calcula features y genera el parquet + feast apply
+    ├── populate_online_store → materializa features recientes al SQLite
+    ├── split_data → obtiene features del feature store y splitea
+    ├── train_model (x N) → entrena experimentos en serie
+    ├── evaluate_model (x N) → evalúa y loguea en MLFlow
+    └── select_best_model → promueve el mejor modelo a producción
 
 Feature Store (Feast)
     ├── Offline Store (parquet) → features históricos para entrenamiento
-    └── Online Store (SQLite)   → features más recientes para inferencia
+    └── Online Store (SQLite) → features más recientes para inferencia
 
-MLflow
-    ├── Experiment tracking     → métricas y artefactos por experimento
-    └── Model Registry          → versiones y alias de producción
+MLFlow
+    ├── Experiment tracking → métricas y artefactos por experimento
+    └── Model Registry → versiones y alias de producción
 
 API REST (FastAPI)
-    ├── GET /api/v1/forecast    → pronóstico de producción de un pozo (gas o petróleo - a elección)
-    └── GET /api/v1/wells       → listado de pozos disponibles
+    ├── GET /api/v1/forecast → pronóstico de producción de un pozo (gas o petróleo - a elección)
+    └── GET /api/v1/wells → listado de pozos disponibles
 ```
 
 ---
@@ -100,7 +100,7 @@ volumes:
   - ./logs:/opt/airflow/logs
   - ./config:/opt/airflow/config
   - ./plugins:/opt/airflow/plugins
-  - ./mlruns:/mlflow/mlruns # Persiste artefactos de MLflow
+  - ./mlruns:/mlflow/mlruns # Persiste artefactos de MLFlow
   - ./feature_store:/opt/airflow/feature_store # Expone el feature store al contenedor
 ```
 
@@ -111,21 +111,21 @@ Esto hace que cada carpeta local sea visible dentro del contenedor en `/opt/airf
 ```
 tp_final/
 ├── dags/
-│   └── dag_oil_and_gas.py          ← DAG principal
+│   └── dag_oil_and_gas.py ← DAG principal
 ├── feature_store/
-│   ├── data/                       ← CSV descargado y parquet con features (generado, no se sube)
-│   ├── registry/                   ← metadata de Feast (generado, no se sube)
-│   ├── online_store/               ← features recientes (generado, no se sube)
-│   ├── feature_store.yaml          ← configuración de Feast
-│   └── features.py                 ← definición de entidades y feature views
+│   ├── data/ ← CSV descargado y parquet con features (generado, no se sube)
+│   ├── registry/ ← metadata de Feast (generado, no se sube)
+│   ├── online_store/ ← features recientes (generado, no se sube)
+│   ├── feature_store.yaml ← configuración de Feast
+│   └── features.py ← definición de entidades y feature views
 ├── api/
-│   └── main.py                     ← API REST con FastAPI
-├── screenshots/                    ← capturas de pantalla del sistema funcionando
-├── mlruns/                         ← artefactos de MLflow (generado, no se sube)
-├── logs/                           ← logs de Airflow (generado, no se sube)
+│   └── main.py ← API REST con FastAPI
+├── screenshots/ ← capturas de pantalla del sistema funcionando
+├── mlruns/ ← artefactos de MLFlow (generado, no se sube)
+├── logs/ ← logs de Airflow (generado, no se sube)
 ├── plugins/
 ├── config/
-├── .env                            ← variables de entorno (no se sube al repo)
+├── .env ← variables de entorno (no se sube al repo)
 ├── .gitignore
 └── docker-compose.yaml
 ```
@@ -161,14 +161,14 @@ El sistema tarda aproximadamente 2-3 minutos en estar completamente operativo (A
 | Servicio | URL | Credenciales |
 |----------|-----|--------------|
 | Airflow UI | http://localhost:8080 | airflow / airflow |
-| MLflow UI | http://localhost:9090 | - |
+| MLFlow UI | http://localhost:9090 | - |
 | API Swagger | http://localhost:8000/docs | - |
 
 ---
 
-## Nota sobre MLflow y seguridad de red
+## Nota sobre MLFlow y seguridad de red
 
-MLflow 3.5+ incluye un middleware de seguridad que por defecto solo acepta conexiones desde localhost. Para permitir conexiones entre contenedores Docker es necesario deshabilitar este middleware con la variable de entorno `MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=true` y arrancar el servidor con `--host 0.0.0.0`. Esto está configurado en el `docker-compose.yaml`.
+MLFlow 3.5+ incluye un middleware de seguridad que por defecto solo acepta conexiones desde localhost. Para permitir conexiones entre contenedores Docker es necesario deshabilitar este middleware con la variable de entorno `MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=true` y arrancar el servidor con `--host 0.0.0.0`. Esto está configurado en el `docker-compose.yaml`.
 
 ---
 
@@ -244,7 +244,7 @@ Todos los features de ventana se calculan con `shift(1)`, que desplaza los valor
 
 ```python
 df['avg_prod_gas_10m'] = df.groupby('idpozo')['prod_gas'].transform(
-    lambda x: x.shift(1).rolling(10, min_periods=1).mean()
+    lambda x: x.shift(1).rolling(10, min_periods = 1).mean()
 )
 ```
 
@@ -314,9 +314,9 @@ Después dropea las filas futuras (`prod_gas = None`), define `X` e `y` para cad
 
 ### Tasks 5 y 6: `train_model` y `evaluate_model`
 
-El DAG entrena **dos modelos completamente independientes**: uno para predecir `prod_gas` y otro para predecir `prod_pet`. No es un modelo que predice ambos targets a la vez. Cada modelo tiene sus propios experimentos, sus propias versiones en el Model Registry y su propio alias `production` en MLflow.
+El DAG entrena **dos modelos completamente independientes**: uno para predecir `prod_gas` y otro para predecir `prod_pet`. No es un modelo que predice ambos targets a la vez. Cada modelo tiene sus propios experimentos, sus propias versiones en el Model Registry y su propio alias `production` en MLFlow.
 
-El loop recorre 10 experimentos en total: 5 para `prod_gas` y 5 para `prod_pet`. Cada experimento varía `n_estimators`, `max_depth` y el conjunto de features. Por cada experimento, `train_model` entrena el modelo y `evaluate_model` lo evalúa y loguea en MLflow.
+El loop recorre 10 experimentos en total: 5 para `prod_gas` y 5 para `prod_pet`. Cada experimento varía `n_estimators`, `max_depth` y el conjunto de features. Por cada experimento, `train_model` entrena el modelo y `evaluate_model` lo evalúa y loguea en MLFlow.
 
 **Features por target:**
 
@@ -330,30 +330,30 @@ Para `prod_pet`:
 
 **Decisión de diseño sobre features separadas:** `avg_prod_gas_10m` no entra como feature para predecir `prod_pet` y viceversa. En pozos no convencionales, la producción de gas y petróleo no siempre están correlacionadas: un pozo puede ser predominantemente gasífero o petrolífero dependiendo de la formación geológica. Mezclar las features de un fluido para predecir el otro podría introducir ruido en lugar de señal.
 
-`evaluate_model` loguea en MLflow las métricas `mae`, `mse`, `rmse` y `r2`, y registra el modelo bajo el nombre `oil_gas_prod_gas` u `oil_gas_prod_pet` según el target. Cada run agrega una nueva versión al modelo registrado correspondiente.
+`evaluate_model` loguea en MLFlow las métricas `mae`, `mse`, `rmse` y `r2`, y registra el modelo bajo el nombre `oil_gas_prod_gas` u `oil_gas_prod_pet` según el target. Cada run agrega una nueva versión al modelo registrado correspondiente.
 
-**Cómo se ve en MLflow:**
+**Cómo se ve en MLFlow:**
 ```
 Experimento: ml_pipeline_oil_and_gas
-  ├── Run: prod_gas_est50_depthNone_featall    → versión 1 de oil_gas_prod_gas
-  ├── Run: prod_gas_est100_depth5_featall      → versión 2 de oil_gas_prod_gas
-  ├── Run: prod_pet_est50_depthNone_featall    → versión 1 de oil_gas_prod_pet
+  ├── Run: prod_gas_est50_depthNone_featall → versión 1 de oil_gas_prod_gas
+  ├── Run: prod_gas_est100_depth5_featall → versión 2 de oil_gas_prod_gas
+  ├── Run: prod_pet_est50_depthNone_featall → versión 1 de oil_gas_prod_pet
   └── ...
 
 Model Registry:
-  ├── oil_gas_prod_gas  → versiones 1 a 5
-  └── oil_gas_prod_pet  → versiones 1 a 5
+  ├── oil_gas_prod_gas → versiones 1 a 5
+  └── oil_gas_prod_pet → versiones 1 a 5
 ```
 
 ### Task 7: `select_best_model`
 
-Corre **una sola vez al final** de todos los experimentos. Consulta MLflow, compara todas las versiones registradas de cada modelo por `r2`, y promueve la mejor usando `set_registered_model_alias` con el alias `"production"`.
+Corre **una sola vez al final** de todos los experimentos. Consulta MLFlow, compara todas las versiones registradas de cada modelo por `r2`, y promueve la mejor usando `set_registered_model_alias` con el alias `"production"`.
 
 El resultado son **dos modelos en producción**:
 - `oil_gas_prod_gas@production` → el mejor modelo para predecir gas
 - `oil_gas_prod_pet@production` → el mejor modelo para predecir petróleo
 
-**Decisión de diseño:** Se usa alias en lugar de stages porque `transition_model_version_stage` está deprecado en versiones recientes de MLflow. El alias `"production"` permite cargar el modelo desde la API con:
+**Decisión de diseño:** Se usa alias en lugar de stages porque `transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` permite cargar el modelo desde la API con:
 
 ```python
 model = mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")
@@ -409,9 +409,9 @@ Devuelve el listado de pozos disponibles para una fecha dada.
 
 ---
 
-## MLflow
+## MLFlow
 
-MLflow trackea todos los experimentos con las siguientes métricas:
+MLFlow trackea todos los experimentos con las siguientes métricas:
 
 - `mae`: Mean Absolute Error
 - `mse`: Mean Squared Error
