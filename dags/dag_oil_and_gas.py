@@ -150,6 +150,19 @@ def ml_pipeline():
     # Guardamos el DataFrame en formato parquet
     offline_feat_df.to_parquet(offline_parquet_path, index = False)
 
+    # Borramos el registry y el SQLite antes de feast apply para garantizar consistencia
+    # con el parquet actual. Feast no sobreescribe entradas del online store cuyo timestamp
+    # sea más reciente que el nuevo dato. Además, feast apply solo crea las tablas del
+    # online store si detecta cambios en el registry — si el registry existe y dice que
+    # la infraestructura ya está creada, no recrea las tablas aunque el SQLite no exista.
+    # Borrando ambos forzamos una instalación limpia en cada corrida del DAG.
+    for path in [
+        os.path.join(feature_store_repo, 'online_store/online.db'),
+        os.path.join(feature_store_repo, 'registry/registry.db'),
+    ]:
+        if os.path.exists(path):
+            os.remove(path)
+
     # Registramos las definiciones de features.py en el registry de Feast y apuntamos al parquet recién generado
     subprocess.run(['feast', 'apply'], cwd = feature_store_repo, check = True)
 
@@ -158,6 +171,10 @@ def ml_pipeline():
     """
     Lee el parquet del offline store, toma la última fila de cada pozo
     (la fila futura sin target) y la materializa en el online store (SQLite).
+
+    feast apply recrea las tablas del SQLite antes de escribir, garantizando
+    consistencia con el parquet actual (el borrado del SQLite ocurre en
+    prepare_offline_store antes del feast apply de esa task).
     """
     # Importamos librería
     from feast import FeatureStore
