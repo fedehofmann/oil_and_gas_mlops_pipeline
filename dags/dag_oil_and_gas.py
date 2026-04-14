@@ -269,15 +269,15 @@ def ml_pipeline():
     return {
         'prod_pet': {
             'X_train': '/opt/airflow/data/splits/X_train.parquet',
-            'X_test':  '/opt/airflow/data/splits/X_test.parquet',
+            'X_test': '/opt/airflow/data/splits/X_test.parquet',
             'y_train': '/opt/airflow/data/splits/y_pet_train.parquet',
-            'y_test':  '/opt/airflow/data/splits/y_pet_test.parquet',
+            'y_test': '/opt/airflow/data/splits/y_pet_test.parquet',
         },
         'prod_gas': {
             'X_train': '/opt/airflow/data/splits/X_train.parquet',
-            'X_test':  '/opt/airflow/data/splits/X_test.parquet',
+            'X_test': '/opt/airflow/data/splits/X_test.parquet',
             'y_train': '/opt/airflow/data/splits/y_gas_train.parquet',
-            'y_test':  '/opt/airflow/data/splits/y_gas_test.parquet',
+            'y_test': '/opt/airflow/data/splits/y_gas_test.parquet',
         }
     }
   @task
@@ -298,7 +298,7 @@ def ml_pipeline():
       model_params = config['model_params']
 
       # Construimos el path del modelo en base al target y los hiperparámetros
-      model_path = f'/opt/airflow/models/model_{target}_{model_params["n_estimators"]}.pkl'
+      model_path = f'/opt/airflow/models/model_{target}_est{model_params["n_estimators"]}_depth{model_params.get("max_depth", "none")}.pkl'
 
       # Leemos los subconjuntos de train filtrando solo las features del experimento
       X_train = pd.read_parquet(splits.get(target).get('X_train'))[features]
