@@ -6,6 +6,26 @@ Este proyecto implementa un pipeline completo de Machine Learning en producción
 
 ---
 
+## Índice
+
+- [Arquitectura](#arquitectura)
+- [Posicionamiento MLOps](#posicionamiento-mlops)
+  - [Arquitectura FTI](#arquitectura-fti)
+  - [Nivel de madurez](#nivel-de-madurez)
+  - [Deuda técnica identificada](#deuda-técnica-identificada)
+  - [Reproducibilidad](#reproducibilidad)
+- [Screenshots](#screenshots)
+- [Setup](#setup)
+- [Cómo reproducir el entrenamiento](#cómo-reproducir-el-entrenamiento)
+- [Decisiones de Diseño](#decisiones-de-diseño)
+- [Feature Store](#feature-store)
+- [Features del Modelo](#features-del-modelo)
+- [DAG: `ml_pipeline_oil_and_gas`](#dag-ml_pipeline_oil_and_gas)
+- [API REST](#api-rest)
+- [MLFlow](#mlflow)
+
+---
+
 ## Arquitectura
 
 ```
@@ -32,6 +52,86 @@ API REST (FastAPI)
     ├── GET /api/v1/forecast → pronóstico de producción de un pozo (gas o petróleo - a elección)
     └── GET /api/v1/wells → listado de pozos disponibles
 ```
+
+---
+
+## Posicionamiento MLOps
+
+### Arquitectura FTI
+
+El proyecto implementa el patrón **Feature → Training → Inference (FTI)**, que separa el sistema en tres pipelines con responsabilidades distintas:
+
+| Pipeline | Responsabilidad | Implementación en este proyecto |
+|---|---|---|
+| **Feature Pipeline** | Ingerir, transformar y almacenar features | Tareas `download_dataset` + `prepare_offline_store` + `populate_online_store` del DAG |
+| **Training Pipeline** | Leer features históricos, entrenar y guardar el modelo | Tareas `split_data` + `train_model` + `evaluate_model` + `select_best_model` del DAG |
+| **Inference Pipeline** | Usar el modelo y features en tiempo real para predecir | API REST (FastAPI) + online store (SQLite) |
+
+El Feature Store es el contrato entre los tres pipelines: garantiza que training e inference lean exactamente las mismas features con la misma lógica de transformación, eliminando el **training-serving skew** (problema que ocurre cuando el modelo se entrena con features calculados de una forma pero en producción se calculan de otra, lo que genera predicciones sesgadas aunque el modelo en sí sea correcto) por inconsistencia de datos.
+
+### Nivel de madurez
+
+Este proyecto implementa **Nivel 1 de MLOps (Continuous Training)** según la clasificación de Google:
+
+| Característica | Nivel 0: Manual | Nivel 1: CT | Nivel 2: CI/CD | Este proyecto |
+|---|---|---|---|---|
+| Construcción del modelo | Manual (notebooks) | Automatizada | Automatizada | **Automatizada** (DAG en Airflow) |
+| Entrenamiento | Manual | Automatizado (CT) | Automatizado (CT) | **Automatizado** (schedule mensual) |
+| Feature Store | No | Sí | Sí | **Sí** (Feast con offline + online store) |
+| Gestión de metadatos | No | Sí | Sí | **Sí** (MLFlow Model Registry) |
+| Despliegue | Manual | Manual/Scripts | Automatizado | **Manual** (API levantada con Docker) |
+| CI/CD | No | No | Integración total | **No** |
+| Monitoreo | No | Métricas básicas | Métricas de sistema y modelo | **Parcial** (métricas de entrenamiento en MLFlow) |
+
+Para alcanzar **Nivel 2** se necesitaría agregar: tests automáticos por cada commit (datos, modelo e infraestructura), canary o blue-green deployment (estrategias de despliegue que sirven el modelo nuevo solo a una fracción del tráfico antes de reemplazar el anterior por completo, reduciendo el riesgo de rollouts fallidos), y monitoreo activo en producción (prediction bias, feature distribution shift).
+
+### Deuda técnica identificada
+
+Aplicando el checklist de Sculley et al. (2015) al proyecto:
+
+| Pregunta | Estado |
+|---|---|
+| ¿Puedo describir qué features usa este modelo sin leer el código? | ✅ Features documentadas en `features.py` y en este README |
+| ¿Puedo reentrenar con un solo comando? | ✅ Un trigger desde la UI de Airflow corre el pipeline completo |
+| ¿Cuántos lenguajes distintos necesito para el pipeline? | ✅ Python únicamente |
+| ¿Hay tests para los datos de entrada? | ❌ No hay validación de schema del CSV descargado |
+
+**Deuda de modelo conocida:** RandomForest tiende a converger a la media del dataset cuando los inputs del online store están fuera de la distribución de entrenamiento. Ver [limitación documentada en la sección API REST](#get-apiv1forecast). Esta deuda es del modelo, no del pipeline: el feature store entrega los features correctos, pero el modelo carece de capacidad discriminativa suficiente para diferenciar pozos en inferencia futura con una sola fila de contexto.
+
+**Deuda de monitoreo:** No hay detección automática de **prediction bias** (tendencia sistemática del modelo a sobreestimar o subestimar respecto a los valores reales) ni **feature distribution shift** (cambio en la distribución estadística de los features de entrada respecto a lo visto durante el entrenamiento, que puede degradar silenciosamente la calidad de las predicciones). El pipeline detectaría degradación del modelo solo al comparar el `r2` (R² o coeficiente de determinación: mide qué proporción de la varianza del target explica el modelo; 1.0 es predicción perfecta, 0 equivale a predecir siempre la media del dataset) del próximo reentrenamiento mensual contra versiones anteriores en MLFlow.
+
+**Deuda de artefactos:** El `LabelEncoder` de `tipoextraccion` se re-entrena en cada corrida dentro de `prepare_offline_store` pero no se guarda como artefacto en MLFlow junto al modelo. Usando la taxonomía de transformaciones de la Clase 3: `prepare_offline_store` aplica transformaciones *model-independent* (filtrado, agrupación por pozo/mes, agregaciones) que son reutilizables y se almacenan en el feature store. El `LabelEncoder` es una transformación *model-dependent* (codificación categórica parametrizada por los datos de entrenamiento) que debería persistirse en MLFlow junto al modelo. Si el CSV upstream incorpora nuevas categorías de extracción entre una corrida y la siguiente, el mapeo puede cambiar, generando training-serving skew latente.
+
+**Deuda de Point-in-Time:** El pipeline construye el dataset de entrenamiento con un join convencional entre features y fechas. No se aplica corrección *point-in-time*, lo que significa que no se reconstruye el estado exacto de cada pozo justo antes del evento de entrenamiento. Si el CSV upstream actualiza retroactivamente filas históricas (el gobierno republica datos corregidos), el modelo podría haberse entrenado con información que no existía en el momento del evento, introduciendo **data leakage** implícito (filtración de información del futuro hacia el pasado durante el entrenamiento: el modelo aprende patrones que no podría haber visto en producción, lo que infla artificialmente las métricas de evaluación y genera un modelo que rinde peor de lo esperado en producción).
+
+**Deuda de sesgos:** El modelo tiene tres sesgos estructurales no mitigados:
+
+1. **Sesgo histórico en los datos:** El dataset refleja decisiones operativas pasadas, no la capacidad de producción real de cada pozo. Pozos con mayor historial de inversión o mantenimiento aparecen con features de ventana (`avg_prod_gas_10m`, `last_prod_gas`) inflados respecto a su producción basal. El modelo aprende esas condiciones operativas codificadas, no la geología del pozo. Esto es sesgo de medición: la variable medida (producción registrada) no captura de forma neutral el fenómeno objetivo (capacidad real del yacimiento).
+
+2. **Convergencia a la media como sesgo diferencial por grupo:** La limitación documentada de RandomForest (tiende a predecir cercano a la media del training set cuando los inputs están fuera de distribución) no afecta de forma uniforme a todos los pozos. En pozos de alta producción el modelo sistemáticamente subestima; en pozos de baja producción sobreestima. Esto es el equivalente en regresión al **disparate impact** (impacto diferencial del modelo sobre distintos grupos: cuando el error sistemático no es aleatorio sino que varía de forma consistente según una característica del grupo, el modelo trata desigualmente a grupos que deberían recibir predicciones igualmente precisas), donde el grupo está definido por nivel de producción en lugar de un atributo demográfico.
+
+3. **Métricas de evaluación no desagregadas:** `evaluate_model` calcula R² y RMSE globales sobre el test set completo. Las métricas agregadas pueden ocultar errores sistemáticos por subgrupo: un R² de 0.85 global es compatible con R² de 0.95 para pozos convencionales y 0.60 para pozos no convencionales. Calcular R² y RMSE por `tipoextraccion` es el análogo en regresión a las métricas de equidad grupales (equal error rates across groups): permite detectar si el modelo comete errores diferenciados según el tipo de extracción, y es especialmente relevante porque `tipoextraccion` es una de las features del modelo.
+
+4. **No fairness through unawareness:** Remover `tipoextraccion` de los features no eliminaría el sesgo diferencial por tipo de extracción. `avg_prod_gas_10m` y `last_prod_gas` son proxies directos de ella: distintos tipos de extracción tienen perfiles de producción histórica muy distintos, por lo que esas variables de ventana ya codifican implícitamente el tipo de extracción. Un modelo entrenado sin `tipoextraccion` aprendería igualmente el patrón a través de los proxies.
+
+**Por qué las técnicas estándar de debiasing no aplican:** Las técnicas de mitigación de sesgo (reweighing, adversarial debiasing, threshold optimizer) están diseñadas para casos donde el atributo sensible *no debería* correlacionar con el target — por ejemplo, cuando la correlación es un artefacto de discriminación histórica en crédito, salud o justicia penal. En el TP, `tipoextraccion` *sí debería* correlacionar con la producción: distintos tipos de extracción producen volúmenes genuinamente distintos de gas/petróleo por razones físicas (presión de yacimiento, permeabilidad, método de recuperación). Aplicar reweighing para descorrelacionar `tipoextraccion` de las predicciones eliminaría una señal causal real y degradaría el modelo. La mitigación correcta en este contexto es la **transparencia evaluativa**: calcular métricas desagregadas por grupo y loguear feature importance, no corregir las predicciones.
+
+### Reproducibilidad
+
+La reproducibilidad de un modelo en producción requiere tres condiciones simultáneas: mismo código, mismos datos y mismo entorno. El proyecto cumple dos de tres:
+
+| Pilar | Estado | Detalle |
+|---|---|---|
+| **Código** | ✅ | Pipeline definido como código Python en Git, versionado en Airflow como DAG |
+| **Datos** | ❌ | CSV descargado de URL pública sin hashear ni versionar — si el gobierno actualiza el dataset retroactivamente, no hay forma de saber qué datos generaron un modelo específico en producción |
+| **Entorno** | ✅ | Docker Compose con dependencias pineadas; `uvicorn==0.40.0` pineado explícitamente para evitar conflicto conocido con Feast |
+
+El gap de datos implica que **la linaje de datos es parcial**: MLFlow registra los parámetros y métricas de cada run, pero no hay un hash o snapshot del CSV asociado a cada versión del modelo. Para cerrar esta brecha se podría hashear el CSV al inicio del DAG y loguear ese hash como parámetro en MLFlow, de modo que cada versión del modelo quede vinculada a una versión concreta del dataset.
+
+Lo que sí está bien cubierto en términos de tracking y empaquetado:
+- **Experiment tracking**: cada run de Airflow registra en MLFlow los hiperparámetros (`n_estimators`, `max_depth`, `test_size`), las métricas (`r2`, `mse`, `rmse`) y el modelo como artefacto
+- **Rollback**: el alias `production` en MLFlow Model Registry puede reasignarse a cualquier versión anterior con un solo comando, sin necesidad de reentrenar
+- **Pipeline as Code**: el DAG en Airflow define el orden de ejecución, las dependencias entre tareas y el schedule en código versionado, no en configuración manual de un servidor
 
 ---
 
@@ -109,13 +209,13 @@ Esto hace que cada carpeta local sea visible dentro del contenedor en `/opt/airf
 ### 5. Estructura de carpetas
 
 ```
-tp_final/
+oil_and_gas_mlops_pipeline/
 ├── dags/
 │   └── dag_oil_and_gas.py ← DAG principal
 ├── feature_store/
-│   ├── data/ ← CSV descargado y parquet con features (generado, no se sube)
+│   ├── data/ ← parquet con features históricos (generado, no se sube)
 │   ├── registry/ ← metadata de Feast (generado, no se sube)
-│   ├── online_store/ ← features recientes (generado, no se sube)
+│   ├── online_store/ ← features recientes en SQLite (generado, no se sube)
 │   ├── feature_store.yaml ← configuración de Feast
 │   └── features.py ← definición de entidades y feature views
 ├── api/
@@ -125,6 +225,8 @@ tp_final/
 ├── logs/ ← logs de Airflow (generado, no se sube)
 ├── plugins/
 ├── config/
+│   └── airflow.cfg ← configuración de Airflow (generado por airflow-init)
+├── roadmap.md ← funcionalidades pendientes para la entrega final
 ├── .env ← variables de entorno (no se sube al repo)
 ├── .gitignore
 └── docker-compose.yaml
@@ -148,6 +250,8 @@ online_store:
 - **offline_store**: archivo parquet con toda la historia de features por pozo y por mes
 - **online_store**: base de datos SQLite con la última fila de cada pozo, lista para inferencia instantánea
 
+El feature store resuelve dos necesidades incompatibles con backends distintos: el offline store optimiza para alto ancho de banda y gran volumen (leer miles de filas por pozo durante entrenamiento), mientras que el online store optimiza para baja latencia en lecturas key-value (recuperar la última fila de un pozo en milisegundos durante inferencia). Un solo backend no puede optimizar ambas a la vez.
+
 ### 7. Cómo levantar el sistema
 
 ```bash
@@ -163,6 +267,10 @@ El sistema tarda aproximadamente 2-3 minutos en estar completamente operativo (A
 | Airflow UI | http://localhost:8080 | airflow / airflow |
 | MLFlow UI | http://localhost:9090 | - |
 | API Swagger | http://localhost:8000/docs | - |
+
+### 9. Nota sobre MLFlow y seguridad de red
+
+MLFlow 3.5+ incluye un middleware de seguridad que por defecto solo acepta conexiones desde localhost. Para permitir conexiones entre contenedores Docker es necesario deshabilitar este middleware con la variable de entorno `MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=true` y arrancar el servidor con `--host 0.0.0.0`. Esto está configurado en el `docker-compose.yaml`.
 
 ---
 
@@ -186,7 +294,7 @@ Ver sección [Decisiones de Diseño](#decisiones-de-diseño) para la justificaci
 | Contexto | Rango | Motivo |
 |---|---|---|
 | **Entorno local** | `2023-01-01` / `2023-12-31` | `get_historical_features` de Feast carga el parquet completo en memoria para el point-in-time join. Con 9 contenedores corriendo, el worker dispone de ~1.5-2GB libres — insuficientes para más de un año de datos |
-| **Producción** | `2021-01-01` / `2023-12-31` | Con un backend distribuido (BigQuery, Spark), Feast puede manejar el dataset completo sin OOM |
+| **Producción** | `2021-01-01` / `2023-12-31` | Con un backend distribuido (BigQuery, Spark), Feast puede manejar el dataset completo sin OOM (Out of Memory: error que ocurre cuando un proceso intenta usar más RAM de la disponible) |
 
 **Por qué 2021 como inicio en producción y no antes:** 2020 fue atípico por COVID-19 (caída de producción documentada en 14 países). A partir de 2021 Vaca Muerta retomó crecimiento sostenido. Además, las técnicas de completación cambiaron radicalmente entre 2012 y 2021 (de 1.500 a 2.500 lb de proppant por pie; costos de USD 20M a USD 11M por pozo), por lo que datos de pozos anteriores representan una realidad operativa distinta e introducen ruido.
 
@@ -236,20 +344,14 @@ En pozos no convencionales, la producción de gas y petróleo no siempre están 
 
 ---
 
-## Nota sobre MLFlow y seguridad de red
-
-MLFlow 3.5+ incluye un middleware de seguridad que por defecto solo acepta conexiones desde localhost. Para permitir conexiones entre contenedores Docker es necesario deshabilitar este middleware con la variable de entorno `MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE=true` y arrancar el servidor con `--host 0.0.0.0`. Esto está configurado en el `docker-compose.yaml`.
-
----
-
 ## Feature Store
 
 ### ¿Por qué un Feature Store?
 
 Cuando el modelo necesita predecir la producción de un pozo, requiere features como el promedio de producción de los últimos 10 meses. Calcularlo en el momento de cada inferencia sería lento y costoso. El feature store resuelve esto separando el problema en dos partes:
 
-- **Offline Store**: almacena los features históricos de todos los pozos en todos los períodos. Se usa para entrenamiento.
-- **Online Store**: almacena solo el estado más reciente de cada pozo. Se usa para inferencia. Es rápido porque los features ya están precomputados.
+- **Offline Store**: almacena los features históricos de todos los pozos en todos los períodos. Se usa para entrenamiento. Internamente es un archivo **parquet** (`well_features.parquet`): un formato de tabla binario (similar a un CSV pero comprimido y de lectura mucho más rápida, especialmente al seleccionar columnas). `prepare_offline_store` toma el CSV de pozos, calcula todos los features y guarda el resultado en ese parquet. Feast lo lee para servir features al entrenamiento.
+- **Online Store**: almacena solo el estado más reciente de cada pozo. Se usa para inferencia. Es rápido porque los features ya están precomputados. Internamente es una base de datos **SQLite** (`online.db`).
 
 ### Offline Store vs Online Store
 
@@ -294,7 +396,7 @@ El dataset contiene lecturas mensuales de producción por pozo. Las columnas rel
 - `prod_agua`: producción de agua (feature)
 - `tef`: tiempo efectivo de flujo (feature)
 - `profundidad`: profundidad del pozo (feature)
-- `tipoextraccion`: tipo de extracción, variable categórica encodada con LabelEncoder (feature)
+- `tipoextraccion`: tipo de extracción, variable categórica encodeada con LabelEncoder (feature)
 
 ### Features calculados
 
@@ -348,7 +450,7 @@ select_best_model
 
 ### Task 1: `download_dataset`
 
-Descarga el CSV desde la URL del gobierno y lo guarda en `/opt/airflow/data/pozos.csv`.
+Descarga el CSV desde la URL del gobierno y lo guarda en `/opt/airflow/data/pozos.csv` dentro del contenedor. Esta ruta no tiene volume mount, por lo que el CSV es efímero: se recrea en cada ejecución del DAG y no persiste en disco en el host.
 
 **Decisión de diseño:** Se descarga el CSV completo cada vez que corre el DAG para asegurar que los datos estén actualizados. El filtro por fechas se aplica después en `prepare_offline_store`.
 
@@ -396,7 +498,22 @@ Después descarta las filas futuras (`prod_gas = None`) y divide en train/test c
 
 El DAG entrena **dos modelos completamente independientes**: uno para predecir `prod_gas` y otro para predecir `prod_pet`. No es un modelo que predice ambos targets a la vez. Cada modelo tiene sus propios experimentos, sus propias versiones en el Model Registry y su propio alias `production` en MLFlow.
 
-El loop recorre 10 experimentos en total: 5 para `prod_gas` y 5 para `prod_pet`. Cada experimento varía `n_estimators`, `max_depth` y el conjunto de features. Por cada experimento, `train_model` entrena el modelo y `evaluate_model` lo evalúa y loguea en MLFlow.
+El loop recorre **10 experimentos en total** (5 por target), todos con `RandomForestRegressor`. Cada experimento varía `n_estimators`, `max_depth` y el conjunto de features. Por cada experimento, `train_model` entrena el modelo y `evaluate_model` lo evalúa y loguea en MLFlow.
+
+| # | Target | `n_estimators` | `max_depth` | Features |
+|---|---|---|---|---|
+| 1 | `prod_pet` | 50 | sin límite | todas (7) |
+| 2 | `prod_pet` | 100 | sin límite | todas (7) |
+| 3 | `prod_pet` | 100 | 5 | todas (7) |
+| 4 | `prod_pet` | 100 | 10 | todas (7) |
+| 5 | `prod_pet` | 100 | sin límite | reducidas (3: `tipoextraccion`, `tef`, `profundidad`) |
+| 6 | `prod_gas` | 50 | sin límite | todas (7) |
+| 7 | `prod_gas` | 100 | sin límite | todas (7) |
+| 8 | `prod_gas` | 100 | 5 | todas (7) |
+| 9 | `prod_gas` | 100 | 10 | todas (7) |
+| 10 | `prod_gas` | 100 | sin límite | reducidas (3: `tipoextraccion`, `tef`, `profundidad`) |
+
+El experimento con features reducidas sirve como baseline de ablación: verifica si el modelo colapsa sin los features de ventana temporal.
 
 **Features por target:**
 
