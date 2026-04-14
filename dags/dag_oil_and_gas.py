@@ -53,16 +53,22 @@ def ml_pipeline():
   def download_dataset(url, save_path):
     """
     Descarga un dataset CSV desde una URL y lo guarda en disco.
+    Calcula el MD5 del archivo para trazabilidad de linaje de datos.
 
     Args: url (str) - URL de descarga, save_path (str) - ruta local del archivo.
-    Retorna: la ruta del archivo guardado.
+    Retorna: dict con 'path' (ruta del archivo) y 'hash' (MD5 del CSV).
     """
+    import hashlib
+
     # Creamos la carpeta en disco (Docker)
     os.makedirs(os.path.dirname(save_path), exist_ok = True)
 
     df = pd.read_csv(url)
     df.to_csv(save_path, index = False)
-    return save_path
+
+    # MD5 del archivo guardado — permite detectar si el CSV cambió entre corridas
+    md5 = hashlib.md5(open(save_path, 'rb').read()).hexdigest()
+    return {'path': save_path, 'hash': md5}
 
   @task
   def prepare_offline_store(read_csv_path, feature_store_repo, **context):
@@ -84,6 +90,9 @@ def ml_pipeline():
     params = context['params']
     date_from = params.get('date_from')
     date_to = params.get('date_to')
+
+    if isinstance(read_csv_path, dict):
+        read_csv_path = read_csv_path['path']
 
     df = pd.read_csv(read_csv_path)
     
@@ -324,14 +333,15 @@ def ml_pipeline():
       }
   
   @task
-  def evaluate_model(results, splits):
+  def evaluate_model(results, splits, dataset_info):
     """
     Carga el modelo entrenado, evalúa sus métricas sobre el conjunto de test,
     las loguea en MLflow y registra el modelo con un nombre para poder cargarlo desde la API.
 
     Args: results (dict) - metadata del modelo incluyendo target, features y model_path,
           splits (dict) - diccionario con paths a cada uno de los subconjuntos de train y test.
-    Retorna: None.
+          dataset_info (dict) - dict con 'path' y 'hash' del CSV descargado.
+    Retorna: dict con 'target' y 'run_id' del experimento.
     """
     # Importamos métricas de Sickit Learn
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -367,6 +377,7 @@ def ml_pipeline():
 
     with mlflow.start_run(run_name = run_name): # Abrimos un nuevo run con ese nombre
         mlflow.log_param('target', results['target']) # Logueamos manualmente el target para filtrar en la UI
+        mlflow.log_param('dataset_hash', dataset_info['hash']) # MD5 del CSV — permite verificar si dos runs usaron los mismos datos
         mlflow.log_params(results['model_params']) # Logueamos los hiperparámetros del experimento
         mlflow.log_metric('mae', mae) # Métricas de evaluación
         mlflow.log_metric('mse', mse)
@@ -491,7 +502,7 @@ def ml_pipeline():
   eval_results = []
   for exp in EXPERIMENTS:
       result = train_model(splits = splits, config = exp) # Entrena el modelo con la config del experimento
-      eval_result = evaluate_model(result, splits) # Evalúa y loguea métricas en MLflow
+      eval_result = evaluate_model(result, splits, csv_path) # Evalúa y loguea métricas en MLflow
       prev_task >> result >> eval_result # Encadena en serie: el anterior termina antes de que arranque el siguiente
       prev_task = eval_result # El próximo experimento arranca cuando este termina
       eval_results.append(eval_result) # Acumulamos el run_id de cada experimento
