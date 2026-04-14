@@ -121,3 +121,46 @@ Estos ítems no son requisitos obligatorios pero cierran deudas documentadas en 
 **Problema:** RandomForest calcula internamente `feature_importances_` en cada entrenamiento, pero ese dato no se persiste en ningún lado. Sin él, no hay forma de saber qué features empujaron la predicción en un run dado, ni de detectar si la importancia relativa de los features cambia entre versiones del modelo (lo que podría indicar data drift o un cambio en la dinámica del yacimiento).
 
 **Implementación:** En la tarea `evaluate_model`, después de calcular las métricas, iterar sobre `zip(feature_cols, model.feature_importances_)` y loguear cada valor como métrica en MLFlow (`mlflow.log_metric(f"importance_{feature}", valor)`). Una línea adicional por target. Con esto, cada run en MLFlow expone qué features usa el modelo de forma explicable y auditable.
+
+---
+
+### 10. Loguear predicciones de la API (prediction logging)
+
+**Origen:** Monitoreo en producción — detección de degradación real vs. degradación en entrenamiento.
+
+**Problema:** El ítem 1 (model decay report) compara métricas de entrenamiento entre runs mensuales. Pero si el modelo se degrada *en producción* entre reentrenamientos — porque los pozos evolucionan o la API recibe pozos con distribución distinta a la de entrenamiento — no hay forma de detectarlo. El R² de entrenamiento puede ser estable mientras el modelo falla silenciosamente en producción.
+
+**Implementación:** En la API (`main.py`), después de cada predicción, loguear en un archivo CSV o tabla SQLite: `id_well`, `date`, `target`, `pred`, `features_used`, `timestamp`. Con ese log, se puede calcular prediction bias real (distribución de predicciones a lo largo del tiempo) y compararlo contra el rango esperado de entrenamiento. En una iteración más avanzada, el DAG podría leer ese log y calcularlo como parte del reporte de model decay del ítem 1.
+
+---
+
+### 11. Threshold de alerta configurable vía variable de entorno
+
+**Origen:** Operabilidad — configurabilidad sin cambios de código.
+
+**Problema:** El ítem 1 propone emitir advertencia si `R²_new < R²_prev - 0.05`. Ese umbral hardcodeado en el código es deuda de configurabilidad: si se quiere ajustar (por ejemplo, ser más estrictos con `0.02` o más tolerantes con `0.10`), hay que modificar el DAG y redeployar.
+
+**Implementación:** Agregar `MODEL_DECAY_THRESHOLD=0.05` como variable en `.env`. El DAG la lee con `os.getenv("MODEL_DECAY_THRESHOLD", "0.05")` al inicio de la tarea `monitor_model`. Así el umbral es configurable por entorno sin tocar código.
+
+---
+
+### 12. Documentar el contrato de datos de la API (OpenAPI descriptions)
+
+**Origen:** Operabilidad — usabilidad del Swagger UI en `/docs`.
+
+**Problema:** Los endpoints tienen docstrings en Python, pero los parámetros individuales no tienen descriptions en el schema OpenAPI. En el Swagger UI (`http://localhost:8000/docs`), los campos aparecen sin explicación de formato, valores válidos ni ejemplos, lo que dificulta el uso por parte de otros equipos o evaluadores.
+
+**Implementación:** En `main.py`, reemplazar los parámetros simples por `Query(...)` con `description` y `example`:
+
+```python
+from fastapi import Query
+
+def get_forecast(
+    id_well: str = Query(..., description="Identificador del pozo", example="12345"),
+    date_start: str = Query(..., description="Fecha de inicio en formato YYYY-MM-DD", example="2023-01-01"),
+    date_end: str = Query(..., description="Fecha de fin en formato YYYY-MM-DD", example="2023-12-01"),
+    target: str = Query("gas", description="Fluido a predecir: 'gas' o 'pet'", example="gas"),
+):
+```
+
+Una línea por parámetro. El Swagger UI refleja los cambios automáticamente.
