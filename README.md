@@ -2,7 +2,37 @@
 
 ## Descripción
 
-Este proyecto implementa un pipeline completo de Machine Learning en producción para pronosticar la producción de gas y petróleo de pozos no convencionales. El sistema integra Airflow para orquestación, MLFlow para tracking de experimentos, Feast como feature store, y una API REST para consumo externo.
+Este proyecto implementa un pipeline completo de Machine Learning en producción para pronosticar la **producción mensual de gas y petróleo por pozo** en yacimientos no convencionales (Vaca Muerta, Argentina). El sistema integra Airflow para orquestación, MLFlow para tracking de experimentos, Feast como feature store, y una API REST para consumo externo.
+
+### Objetivo
+
+Dado el historial de producción de un pozo, predecir cuántos m³ de gas o petróleo producirá ese pozo en un mes dado. El sistema entrena y actualiza los modelos mensualmente de forma automática, expone las predicciones a través de una API REST, y mantiene trazabilidad completa de experimentos y versiones de modelo.
+
+### Datos
+
+El dataset proviene del [Ministerio de Energía de Argentina](http://datos.energia.gob.ar) y contiene lecturas mensuales de producción por pozo no convencional. Las variables principales son:
+
+| Variable | Tipo | Rol |
+|---|---|---|
+| `prod_gas` | Numérica (m³/mes) | **Target** — producción de gas |
+| `prod_pet` | Numérica (m³/mes) | **Target** — producción de petróleo |
+| `tipoextraccion` | Categórica | Feature — tipo de extracción (ej: shale, tight) |
+| `profundidad` | Numérica (m) | Feature — profundidad del pozo |
+| `tef` | Numérica (días) | Feature — tiempo efectivo de flujo en el mes |
+| `prod_agua` | Numérica (m³/mes) | Feature — producción de agua asociada |
+| `avg_prod_gas_10m` | Numérica | Feature calculado — promedio de producción de gas de los últimos 10 meses |
+| `avg_prod_pet_10m` | Numérica | Feature calculado — ídem para petróleo |
+| `last_prod_gas` | Numérica | Feature calculado — última producción de gas conocida |
+| `last_prod_pet` | Numérica | Feature calculado — ídem para petróleo |
+| `n_readings` | Entera | Feature calculado — cantidad de lecturas acumuladas del pozo (proxy de madurez) |
+
+Se recomienda filtrar el dataset a partir de 2021 pasando `date_from=2021-01-01` al triggerear el DAG, para excluir la distorsión de COVID-19 (2020) y la heterogeneidad tecnológica de pozos anteriores a la maduración de Vaca Muerta. El filtro no es automático — ver [Cómo reproducir el entrenamiento](#cómo-reproducir-el-entrenamiento) para los rangos recomendados según el entorno.
+
+### Modelo y métricas
+
+Se entrenan dos modelos independientes (`prod_gas` y `prod_pet`) usando **RandomForestRegressor**. Se evalúan 10 experimentos por target variando `n_estimators`, `max_depth` y el conjunto de features. El modelo con mejor score es promovido automáticamente a producción en MLFlow.
+
+Las métricas de evaluación son **R²** (coeficiente de determinación), **RMSE** y **MAE** sobre un test set temporal (20% de fechas más recientes).
 
 ---
 
