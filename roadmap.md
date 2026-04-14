@@ -1,5 +1,22 @@
 # Roadmap — Entrega Final (28/5)
 
+## Orden de desarrollo
+
+| Prioridad | Issue | Motivo |
+|---|---|---|
+| 1 | #6 Ray Serve | Obligatorio. Mayor riesgo técnico — va primero para tener margen de debuggear |
+| 2 | #7 Model decay report + #8 Threshold configurable | Obligatorios. Van en el mismo PR |
+| 3 | #9 Evaluación desagregada + #10 Feature importance | Quick wins. Tocan la misma función (`evaluate_model`) — mismo PR |
+| 4 | #12 CSV hash | Quick win. Una línea en `download_dataset` |
+| 5 | #16 CI/CD | En este punto el código está estabilizado y los tests cubren algo real. Los PRs siguientes sirven como demostración del flujo completo |
+| 6 | #11 OpenAPI descriptions | Quick win. Solo en `main.py`, no toca el DAG |
+| 7 | #13 LabelEncoder como artefacto | Deuda técnica. Modifica `train_model` y la API |
+| 8 | #14 Validación de schema | Deuda técnica. Modifica `download_dataset` |
+| 9 | #15 Prediction logging | Deuda técnica. Solo en `main.py` |
+| 10 | #17 Point-in-Time | El más complejo arquitecturalmente. Solo si hay tiempo |
+
+---
+
 ## Requerimientos obligatorios pendientes
 
 Estos dos puntos son DEBE en la especificación del trabajo integrador y aún no están implementados.
