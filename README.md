@@ -290,9 +290,9 @@ Desde la UI de Airflow en http://localhost:8080, triggerear el DAG `ml_pipeline_
 - `date_from`: fecha de inicio del rango de entrenamiento (formato `YYYY-MM-DD`)
 - `date_to`: fecha de fin del rango de entrenamiento (formato `YYYY-MM-DD`)
 
-Si no se especifican fechas, se usa el dataset completo. Ver [Decisiones de Diseño](#decisiones-de-diseño) para la justificación del rango recomendado.
+**En entorno local se recomienda usar un rango de un año**, por ejemplo `2023-01-01` / `2023-12-31`. `get_historical_features` de Feast carga el parquet completo en memoria para el point-in-time join — con 9 contenedores corriendo el worker dispone de ~1.5-2GB libres, insuficientes para más de un año de datos. Sin fechas, el DAG intenta procesar el dataset completo y falla por OOM.
 
-Ver sección [Decisiones de Diseño](#decisiones-de-diseño) para la justificación completa del rango de fechas.
+Ver [Decisiones de Diseño](#decisiones-de-diseño) para la justificación del rango recomendado.
 
 ---
 
