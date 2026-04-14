@@ -339,6 +339,7 @@ def ml_pipeline():
     # Importamos MLFlow
     import mlflow
     import mlflow.sklearn
+    from mlflow.tracking import MlflowClient
 
     # Definimos las variables que fueron seleccionadas para entrenar (tienen que ser las mismas para no romper)
     features = results['features']
@@ -374,6 +375,36 @@ def ml_pipeline():
         # Registramos el modelo con un nombre para poder cargarlo después desde la API
         # Cada run crea una nueva versión del modelo registrado
         mlflow.sklearn.log_model(loaded_model, "model", registered_model_name = f"oil_gas_{results['target']}")
+
+        # Agregamos tags y descripción a la versión recién creada para que el Model Registry sea legible
+        client = MlflowClient()
+        run_id = mlflow.active_run().info.run_id
+        versions = client.search_model_versions(f"run_id='{run_id}'")
+        if versions:
+            model_name = f"oil_gas_{results['target']}"
+            version = versions[0].version
+            feat_label = 'all' if len(results['features']) > 3 else 'reduced'
+            depth_label = str(results['model_params'].get('max_depth', 'None'))
+
+            client.set_model_version_tag(model_name, version, 'run_name', run_name)
+            client.set_model_version_tag(model_name, version, 'n_estimators', str(results['model_params']['n_estimators']))
+            client.set_model_version_tag(model_name, version, 'max_depth', depth_label)
+            client.set_model_version_tag(model_name, version, 'features', feat_label)
+            client.set_model_version_tag(model_name, version, 'r2', f"{r2:.4f}")
+
+            client.update_model_version(
+                name = model_name,
+                version = version,
+                description = f"RandomForest | n_estimators={results['model_params']['n_estimators']} | max_depth={depth_label} | features={feat_label} | R²={r2:.4f} | RMSE={rmse:.2f}"
+            )
+
+            # Descripción a nivel del modelo registrado (se sobreescribe en cada run, pero el contenido es estático)
+            fluid = 'petróleo' if results['target'] == 'prod_pet' else 'gas'
+            feat_list = ', '.join(results['features'])
+            client.update_registered_model(
+                name = model_name,
+                description = f"Predice producción mensual de {fluid} (m³) por pozo. Entrenado con RandomForestRegressor sobre datos del MINEM (producción no convencional). Features: {feat_list}."
+            )
 
   @task
   def select_best_model():
