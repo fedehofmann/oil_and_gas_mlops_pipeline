@@ -384,7 +384,19 @@ En pozos no convencionales, la producción de gas y petróleo no siempre están 
 
 ### 6. Alias `production` en lugar de stages en MLFlow
 
-`transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` es el mecanismo recomendado y permite cargar el modelo con `mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")`. Si el DAG vuelve a correr y encuentra un modelo mejor, el alias se mueve automáticamente — la API siempre sirve el mejor modelo sin cambiar el código. `select_best_model` compara todas las versiones históricas acumuladas en MLFlow, no solo las de la última corrida.
+`transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` es el mecanismo recomendado y permite cargar el modelo con `mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")`. Si el DAG vuelve a correr y encuentra un modelo mejor, el alias se mueve automáticamente — la API siempre sirve el mejor modelo sin cambiar el código. `select_best_model` compara solo las versiones generadas en la corrida actual — ver decisión #8.
+
+### 8. `select_best_model` compara solo versiones del run actual
+
+`select_best_model` filtra por los `run_id` generados en el DAG actual, en lugar de comparar todas las versiones históricas acumuladas en MLFlow.
+
+**Trade-off considerado:** comparar contra el historial completo podría conservar en producción un modelo con R² más alto entrenado en una corrida anterior. Se descartó por dos razones:
+
+1. **Las métricas no son comparables entre runs**: un R² calculado sobre el test set del run A (entrenado con dataset completo) y un R² del run B (entrenado con 2023 únicamente) se evalúan sobre distribuciones distintas. Comparar esos valores directamente no tiene significado estadístico.
+
+2. **Rompe la reproducibilidad del pipeline**: si el modelo en `@production` depende del historial acumulado en MLFlow, dos instancias del mismo sistema (o dos colaboradores) pueden terminar con modelos distintos en producción aunque hayan corrido el mismo código con los mismos datos.
+
+**Separación de responsabilidades:** `select_best_model` elige el mejor modelo *de esta corrida*. Si ese modelo degrada respecto al ciclo anterior, el model decay report (pendiente) lo detecta y alerta. Son dos preguntas distintas que no deben mezclarse en la misma función.
 
 ### 7. Predicción autoregresiva descartada en la API
 
