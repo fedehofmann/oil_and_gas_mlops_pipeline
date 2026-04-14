@@ -376,6 +376,12 @@ Lee el parquet, se queda con la última fila de cada pozo (la fila futura sin ta
 
 **Decisión de diseño:** Corre después de `prepare_offline_store` para garantizar que el parquet ya existe. El online store siempre tiene exactamente una fila por pozo.
 
+**Decisión de diseño — borrado del registry y el SQLite antes de `feast apply`:** Al inicio de `prepare_offline_store` se borran `registry/registry.db` y `online_store/online.db` antes de correr `feast apply`. Esto garantiza que el online store siempre quede sincronizado con el parquet de la corrida actual.
+
+Sin este borrado, pueden ocurrir dos problemas encadenados:
+1. **Datos rancios en el online store:** Feast no sobreescribe entradas cuyo timestamp almacenado sea más reciente que el nuevo dato. Si una corrida anterior usó un rango de fechas más amplio (timestamps más nuevos), los valores viejos persisten aunque el parquet haya cambiado.
+2. **"no such table" en `populate_online_store`:** `feast apply` solo crea las tablas del SQLite si detecta cambios en el registry. Si el registry dice que la infraestructura ya existe, no recrea las tablas aunque el SQLite haya sido borrado — y `write_to_online_store` falla. Borrando también el registry, `feast apply` trata todo como instalación nueva y recrea las tablas correctamente.
+
 ### Task 4: `split_data`
 
 Obtiene los features históricos del offline store via Feast usando `get_historical_features`, que hace un **point-in-time lookup**: para cada par `(idpozo, fecha)`, devuelve los features tal como eran en esa fecha exacta, garantizando que no hay data leakage entre el pasado y el futuro.
@@ -459,19 +465,31 @@ Devuelve el pronóstico de producción de un pozo para el próximo mes.
    - **Fecha futura (posterior al último dato del parquet):** usa los features del online store (estado más reciente del pozo). El modelo predice un solo paso; se repite la misma predicción para todos los meses futuros sin actualización autoregresiva, para evitar distribution shift en `avg_prod_10m`
 3. Devuelve un punto por cada mes del rango
 
-**Ejemplo de respuesta:**
+**Ejemplo: rango histórico (pozo 3640, enero–junio 2023)**
+
+Los primeros dos meses tienen registros reales en el parquet; a partir de marzo el pozo ya no tiene datos y la API usa el online store repitiendo la misma predicción:
+
 ```json
 {
   "id_well": "3640",
   "data": [
-    { "date": "2023-10-01", "prod": 312.45 },
-    { "date": "2023-11-01", "prod": 298.10 },
-    { "date": "2023-12-01", "prod": 298.10 }
+    { "date": "2023-01-01", "prod": 27.8  },
+    { "date": "2023-02-01", "prod": 25.02 },
+    { "date": "2023-03-01", "prod": 27.8  },
+    { "date": "2023-04-01", "prod": 27.8  },
+    { "date": "2023-05-01", "prod": 27.8  },
+    { "date": "2023-06-01", "prod": 27.8  }
   ]
 }
 ```
 
+Enero y febrero varían porque cada mes usa sus propios features históricos (producción real de los meses anteriores). A partir de marzo, el pozo no tiene más registros en el dataset: la API toma el estado más reciente del online store y repite la misma predicción para todos los meses futuros del rango.
+
+**Cómo identificar el límite en la respuesta:** el primer valor que se repite consecutivamente con el mismo número indica la transición del offline store al online store para ese pozo.
+
 **Decisión de diseño — predicción autoregresiva descartada:** Actualizar `avg_prod_10m` con valores predichos introduce distribution shift (el feature fue calculado sobre producción real en entrenamiento). En pozos shale con decline pronunciado, el error se autocorrela. La alternativa de repetir la misma predicción para fechas futuras es más honesta respecto a las limitaciones del modelo single-step.
+
+**Nota sobre consistencia del online store:** En versiones anteriores del código se observaba una diferencia llamativa entre la predicción del último mes histórico y la del primer mes futuro (online store), causada por datos rancios en el SQLite de corridas anteriores. Este comportamiento fue corregido: `prepare_offline_store` borra el registry y el SQLite antes de cada `feast apply`, garantizando que el online store siempre refleje el estado actual del parquet.
 
 ### `GET /api/v1/wells`
 
