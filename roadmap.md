@@ -14,14 +14,31 @@ Estos dos puntos son DEBE en la especificación del trabajo integrador y aún no
 
 **Propuesta de implementación:**
 
-Agregar una tarea `monitor_model` al final del DAG (después de `select_best_model`) que compare el modelo recién entrenado contra la versión anterior en producción y genere un reporte con al menos estas dos métricas:
+Agregar una tarea `monitor_model` al final del DAG (después de `select_best_model`) que compare el modelo recién entrenado contra la versión anterior en producción y genere un reporte con estas métricas:
 
 | Métrica | Qué mide | Cómo calcularlo |
 |---|---|---|
 | **R² delta** | Model decay: si el nuevo modelo performa peor que el anterior | Comparar `r2` del run actual contra el `r2` del modelo con alias `production` en MLFlow |
 | **Feature distribution shift** | Data drift: si la distribución del input cambió respecto al ciclo anterior | Comparar media y desvío de cada feature numérico del parquet actual contra el snapshot del ciclo anterior; loguear como métricas en MLFlow |
+| **PSI sobre features de ventana temporal** | Data drift en los features más sensibles al régimen de producción | Calcular Population Stability Index sobre `avg_prod_gas_10m` y `avg_prod_pet_10m` entre el ciclo actual y el anterior. PSI > 0.1 es alerta amarilla; PSI > 0.25 es alerta roja |
+| **Prediction bias** | Concept drift: si el modelo empieza a sobreestimar o subestimar sistemáticamente | `mean(pred - actual)` sobre el test set. Un bias sostenido en un sentido es señal de drift antes de que R² caiga |
+| **R² ventana reciente vs. R² global** | Concept drift temporal: si el modelo pierde precisión en el régimen actual | Calcular R² solo sobre los últimos 3 meses del test set y compararlo contra el R² global del mismo run. Si divergen, el modelo funciona mejor en datos históricos que en los más recientes |
 
-El reporte puede ser un artefacto JSON o HTML logueado en MLFlow al final del run. Si el delta de R² supera un umbral configurable (ej. `R²_new < R²_prev - 0.05`), el DAG puede emitir una advertencia via log o Airflow alert.
+El reporte puede ser un artefacto JSON o HTML logueado en MLFlow al final del run. Si el delta de R² supera un umbral configurable (ver ítem 11), el DAG emite una advertencia via log o Airflow alert.
+
+**Criterio de selección del modelo a producción:**
+
+El `select_best_model` actual promueve la versión con mayor R² global. Con el reporte de monitoreo, el criterio puede volverse más robusto usando filtrado secuencial:
+
+1. **Filtro de umbral mínimo:** descartar versiones con `R² < 0.85` (modelo inutilizable)
+2. **Filtro de bias:** descartar versiones con `|prediction_bias| > umbral_configurable` (modelo sistemáticamente sesgado)
+3. **Selección por score compuesto** entre los modelos que pasan los filtros:
+
+```
+score = 0.5 × R² + 0.3 × (1 - RMSE_normalizado) + 0.2 × (1 - |bias_normalizado|)
+```
+
+La ponderación refleja prioridades del problema: R² es el indicador principal de capacidad predictiva (0.5), RMSE en unidades originales (m³) es lo que el operador interpreta directamente (0.3), y el bias penaliza subestimación/sobreestimación sistemática que tiene impacto económico real (0.2). Los pesos son configurables vía variables de entorno junto al umbral del ítem 11.
 
 ---
 
