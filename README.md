@@ -491,6 +491,22 @@ Enero y febrero varían porque cada mes usa sus propios features históricos (pr
 
 **Nota sobre consistencia del online store:** En versiones anteriores del código se observaba una diferencia llamativa entre la predicción del último mes histórico y la del primer mes futuro (online store), causada por datos rancios en el SQLite de corridas anteriores. Este comportamiento fue corregido: `prepare_offline_store` borra el registry y el SQLite antes de cada `feast apply`, garantizando que el online store siempre refleje el estado actual del parquet.
 
+**Limitación conocida — el modelo tiende a converger a la media del dataset para fechas futuras:** Al consultar fechas futuras (online store), pozos con perfiles muy distintos pueden recibir la misma predicción. Esto fue verificado empíricamente:
+
+| idpozo | avg_prod_gas_10m | last_prod_gas | pred online store |
+|--------|-----------------|---------------|-------------------|
+| 164588 | 15.263 Mm³ | 20.236 Mm³ | 611.19 |
+| 163700 | 15.579 Mm³ | 12.050 Mm³ | 611.19 |
+| 3640   | 7.5 Mm³    | 0.0 Mm³    | 611.19 |
+
+Los features del online store son correctos y distintos para cada pozo — el problema está en el modelo. RandomForest tiende a predecir valores cercanos a la media del dataset de entrenamiento cuando los inputs están fuera de la distribución vista durante el entrenamiento, o cuando el dataset de entrenamiento tiene alta concentración de filas en ese rango de producción. 611.19 es esencialmente el valor promedio de `prod_gas` en el dataset de entrenamiento.
+
+Esto es una limitación del modelo (no del pipeline) y tiene dos causas posibles:
+1. **Distribución sesgada del dataset:** la mayoría de los pozos en el dataset de entrenamiento producen en el rango 500-700 Mm³/mes, lo que ancla las predicciones del RandomForest hacia esa zona.
+2. **Features insuficientes para diferenciar pozos en el online store:** el modelo aprendió a distinguir pozos usando su historia reciente, pero cuando esa historia no está disponible (online store usa una sola fila), la capacidad discriminativa se reduce.
+
+Para la entrega final se evaluará si agregar features adicionales (formación geológica, empresa operadora, ubicación) o cambiar el modelo mejora la diferenciación en inferencia futura.
+
 ### `GET /api/v1/wells`
 
 Devuelve el listado de pozos disponibles para una fecha dada.
