@@ -49,7 +49,7 @@ MLFlow
     └── Model Registry → versiones y alias de producción
 
 API REST (FastAPI)
-    ├── GET /api/v1/forecast → pronóstico de producción de un pozo (gas o petróleo - a elección)
+    ├── GET /api/v1/forecast → pronóstico de producción de un pozo (gas o petróleo)
     └── GET /api/v1/wells → listado de pozos disponibles
 ```
 
@@ -148,10 +148,22 @@ Lo que sí está bien cubierto en términos de tracking y empaquetado:
 ![MLflow Model Registry](screenshots/MLFlow_Model_Registry.png)
 
 ### API REST - Endpoint `/api/v1/wells`
+
+El endpoint devuelve los pozos disponibles para una fecha dentro del período de entrenamiento. Los pozos disponibles dependen del parquet generado por el DAG.
+
 ![GET Listado Pozo](screenshots/GET_Listado_Pozo.png)
 
-### API REST - Endpoint `/api/v1/forecast`
+### API REST - Endpoint `/api/v1/forecast` — fechas futuras
+
+El DAG fue entrenado con datos de 2023. Al pedir predicción para los 3 meses siguientes (2024), el modelo usa los features del online store y devuelve la misma predicción para cada mes — comportamiento esperado para un modelo single-step sin actualización autoregresiva.
+
 ![GET Forecast](screenshots/GET_Forecast.png)
+
+### API REST - Endpoint `/api/v1/forecast` — fechas históricas
+
+Al pedir predicción para 4 meses dentro del período de entrenamiento (2023), el modelo usa los features reales de cada mes desde el parquet. Cada mes tiene su propio `avg_prod_gas_10m` y `last_prod_gas` calculados con producción real, por lo que los valores predichos varían. Esto permite evaluar el comportamiento del modelo sobre el training set.
+
+![GET Forecast II](screenshots/GET_Forecast_II.png)
 
 ---
 
@@ -165,8 +177,6 @@ Lo que sí está bien cubierto en términos de tracking y empaquetado:
 ### 2. `.gitignore` recomendado
 
 Este repositorio solo versiona el código fuente (`.py`, `.yaml`, `.yml`, `.md`) necesario para entender y reproducir el proyecto. Las carpetas generadas automáticamente al correr el DAG no se suben al repo ya que pueden pesar varios GBs y se regeneran solas con un solo `docker compose up`.
-
-Antes de hacer el primer commit, asegurate de tener un `.gitignore` en la raíz con al menos:
 
 ```
 mlruns/
@@ -200,8 +210,8 @@ volumes:
   - ./logs:/opt/airflow/logs
   - ./config:/opt/airflow/config
   - ./plugins:/opt/airflow/plugins
-  - ./mlruns:/mlflow/mlruns # Persiste artefactos de MLFlow
-  - ./feature_store:/opt/airflow/feature_store # Expone el feature store al contenedor
+  - ./mlruns:/mlflow/mlruns
+  - ./feature_store:/opt/airflow/feature_store
 ```
 
 Esto hace que cada carpeta local sea visible dentro del contenedor en `/opt/airflow/...`. Por eso todos los paths en el código usan `/opt/airflow/...` y no `./`.
@@ -235,7 +245,6 @@ oil_and_gas_mlops_pipeline/
 ### 6. `feature_store.yaml`
 
 ```yaml
-# Paths absolutos del contenedor Docker
 project: oil_gas_production
 registry: /opt/airflow/feature_store/registry/registry.db
 provider: local
@@ -258,7 +267,7 @@ El feature store resuelve dos necesidades incompatibles con backends distintos: 
 docker compose up -d
 ```
 
-El sistema tarda aproximadamente 2-3 minutos en estar completamente operativo (Airflow necesita inicializar su base de datos).
+El sistema tarda aproximadamente 2-3 minutos en estar completamente operativo.
 
 ### 8. Acceso a los servicios
 
@@ -281,7 +290,7 @@ Desde la UI de Airflow en http://localhost:8080, triggerear el DAG `ml_pipeline_
 - `date_from`: fecha de inicio del rango de entrenamiento (formato `YYYY-MM-DD`)
 - `date_to`: fecha de fin del rango de entrenamiento (formato `YYYY-MM-DD`)
 
-**Rango recomendado para entornos locales:** `date_from=2023-01-01`, `date_to=2023-12-31`.
+Si no se especifican fechas, se usa el dataset completo. Ver [Decisiones de Diseño](#decisiones-de-diseño) para la justificación del rango recomendado.
 
 Ver sección [Decisiones de Diseño](#decisiones-de-diseño) para la justificación completa del rango de fechas.
 
@@ -340,7 +349,12 @@ En pozos no convencionales, la producción de gas y petróleo no siempre están 
 
 ### 6. Alias `production` en lugar de stages en MLFlow
 
-`transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` es el mecanismo recomendado y permite cargar el modelo con `mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")`.
+`transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` es el mecanismo recomendado y permite cargar el modelo con `mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")`. Si el DAG vuelve a correr y encuentra un modelo mejor, el alias se mueve automáticamente — la API siempre sirve el mejor modelo sin cambiar el código. `select_best_model` compara todas las versiones históricas acumuladas en MLFlow, no solo las de la última corrida.
+
+### 7. Predicción autoregresiva descartada en la API
+
+Para fechas futuras la API repite la misma predicción en lugar de actualizar `avg_prod_10m` con valores predichos. Alimentar el modelo con sus propias predicciones cambiaría la distribución del feature respecto al entrenamiento (distribution shift). En pozos shale con decline pronunciado, el error se autocorrelacionaría. Repetir la predicción del estado más reciente es más honesto respecto a las limitaciones de un modelo single-step.
+
 
 ---
 
@@ -352,6 +366,7 @@ Cuando el modelo necesita predecir la producción de un pozo, requiere features 
 
 - **Offline Store**: almacena los features históricos de todos los pozos en todos los períodos. Se usa para entrenamiento. Internamente es un archivo **parquet** (`well_features.parquet`): un formato de tabla binario (similar a un CSV pero comprimido y de lectura mucho más rápida, especialmente al seleccionar columnas). `prepare_offline_store` toma el CSV de pozos, calcula todos los features y guarda el resultado en ese parquet. Feast lo lee para servir features al entrenamiento.
 - **Online Store**: almacena solo el estado más reciente de cada pozo. Se usa para inferencia. Es rápido porque los features ya están precomputados. Internamente es una base de datos **SQLite** (`online.db`).
+
 
 ### Offline Store vs Online Store
 
@@ -369,6 +384,12 @@ Cuando el modelo necesita predecir la producción de un pozo, requiere features 
 |--------|-----------------|---------------|------------|
 | 132879 | 441.0 | 455.3 | 48 |
 
+### ¿Por qué el online store está en SQLite y no en el parquet?
+
+El parquet puede tener millones de filas — una por pozo por mes durante años. Leerlo completo en cada request de inferencia sería inviable. El online store resuelve esto copiando solo la última fila de cada pozo al SQLite. Cuando la API necesita los features de un pozo, hace un lookup por clave primaria (`idpozo`) en O(1) — sin importar cuántos pozos o cuánta historia exista en el parquet.
+
+En resumen: el offline store *calcula* los features, el online store los *sirve rápido*.
+
 ### Materialización
 
 Es el proceso de copiar los features más recientes del offline store al online store. Se ejecuta una vez por mes junto con el reentrenamiento. En Feast se hace con `write_to_online_store`.
@@ -377,7 +398,7 @@ Es el proceso de copiar los features más recientes del offline store al online 
 
 Define el contrato de features que Feast espera encontrar en el parquet. Tiene tres componentes:
 
-- **Entity**: el "sujeto" de los features. En este caso el pozo (`idpozo`). Feast necesita saber quién es el protagonista para buscar features por ID.
+- **Entity**: el "sujeto" de los features. En este caso el pozo (`idpozo`).
 - **FileSource**: le dice a Feast dónde está el parquet y qué columna usar como timestamp para el point-in-time lookup.
 - **FeatureView**: une la entidad con la fuente y define el esquema (nombre y tipo de cada feature). Los nombres tienen que coincidir exactamente con las columnas del parquet.
 
@@ -400,8 +421,6 @@ El dataset contiene lecturas mensuales de producción por pozo. Las columnas rel
 
 ### Features calculados
 
-Además de las columnas del dataset original, se calculan features de ventana que capturan el comportamiento reciente de cada pozo:
-
 | Feature | Descripción | Justificación |
 |---------|-------------|---------------|
 | `avg_prod_gas_10m` | Promedio de prod_gas de las últimas 10 lecturas | Captura la tendencia reciente del pozo |
@@ -412,11 +431,11 @@ Además de las columnas del dataset original, se calculan features de ventana qu
 
 ### ¿Por qué `shift(1)`?
 
-Todos los features de ventana se calculan con `shift(1)`, que desplaza los valores un período hacia adelante. Esto evita **data leakage**: cuando el modelo está parado en marzo 2020, solo puede ver datos hasta febrero 2020. Sin el shift, estaría usando datos del mes actual para predecir ese mismo mes.
+Todos los features de ventana se calculan con `shift(1)`, que desplaza los valores un período hacia adelante. Esto evita **data leakage**: cuando el modelo está parado en marzo 2020, solo puede ver datos hasta febrero 2020.
 
 ```python
 df['avg_prod_gas_10m'] = df.groupby('idpozo')['prod_gas'].transform(
-    lambda x: x.shift(1).rolling(10, min_periods = 1).mean()
+    lambda x: x.shift(1).rolling(10, min_periods=1).mean()
 )
 ```
 
@@ -428,7 +447,7 @@ Para cada pozo, se genera una fila extra con fecha del próximo mes y sin target
 
 ## DAG: `ml_pipeline_oil_and_gas`
 
-El DAG orquesta todo el pipeline. Corre automáticamente el **primer día de cada mes** (`schedule="0 0 1 * *"`), alineado con la frecuencia natural del dataset (producción mensual por pozo). También se puede triggerear manualmente desde la UI de Airflow con parámetros opcionales `date_from` y `date_to` para filtrar el dataset por rango de fechas, lo que permite reproducir el entrenamiento para cualquier fecha histórica con un solo comando.
+El DAG corre automáticamente el **primer día de cada mes** (`schedule="0 0 1 * *"`), alineado con la frecuencia natural del dataset. También se puede triggerear manualmente con parámetros opcionales `date_from` y `date_to`.
 
 ### Flujo de tasks
 
@@ -454,49 +473,33 @@ Descarga el CSV desde la URL del gobierno y lo guarda en `/opt/airflow/data/pozo
 
 **Decisión de diseño:** Se descarga el CSV completo cada vez que corre el DAG para asegurar que los datos estén actualizados. El filtro por fechas se aplica después en `prepare_offline_store`.
 
+
 ### Task 2: `prepare_offline_store`
 
-Lee el CSV, aplica todas las transformaciones y genera el parquet del offline store. Al finalizar ejecuta `feast apply` para registrar las definiciones en el registry.
+Lee el CSV, aplica todas las transformaciones y genera el parquet del offline store. Transformaciones en orden:
 
-**Transformaciones en orden:**
-1. Construye la columna `fecha` a partir de `anio` y `mes`
-2. Selecciona las columnas relevantes y dropea nulos
-3. Encodea `tipoextraccion` con `LabelEncoder` (texto → número)
-4. Calcula los features de ventana con pandas vectorizado (`groupby + rolling + shift`) sobre el **dataset completo**
-5. **Aplica el filtro de fechas** (`date_from` / `date_to`) recién aquí, después de los features
+1. Construye `fecha` a partir de `anio` y `mes`
+2. Selecciona columnas relevantes y dropea nulos
+3. Encodea `tipoextraccion` con `LabelEncoder`
+4. Calcula features de ventana sobre el **dataset completo** (`groupby + rolling + shift`)
+5. Aplica el filtro de fechas (`date_from` / `date_to`) después de los features
 6. Genera la fila futura por pozo para el online store
-7. Guarda el parquet en `/opt/airflow/feature_store/data/well_features.parquet`
-8. Ejecuta `feast apply` para registrar el parquet en el registry de Feast
-
-**Decisión de diseño — orden del filtro de fechas:** El filtro se aplica *después* del cálculo de features para evitar data leakage. Si se filtrara primero, el rolling de la primera fila del rango solo tendría contexto desde `date_from`, perdiendo todo el historial anterior. Por ejemplo, si se entrena con datos desde 2021, el `avg_prod_gas_10m` de enero 2021 igual refleja los 10 meses previos (2020), no solo los datos del rango de entrenamiento.
-
-**Decisión de diseño — pandas vectorizado:** Se usa `groupby + rolling` en lugar de un loop por pozo. Pandas procesa todas las filas internamente sin iterar en Python puro, lo que es significativamente más eficiente con datasets de cientos de miles de filas.
+7. Borra el registry y el SQLite antes de `feast apply` para garantizar consistencia
+8. Guarda el parquet y ejecuta `feast apply`
 
 ### Task 3: `populate_online_store`
 
-Lee el parquet, se queda con la última fila de cada pozo (la fila futura sin target) y la escribe en el SQLite via `write_to_online_store`.
-
-**Decisión de diseño:** Corre después de `prepare_offline_store` para garantizar que el parquet ya existe. El online store siempre tiene exactamente una fila por pozo.
-
-**Decisión de diseño — borrado del registry y el SQLite antes de `feast apply`:** Al inicio de `prepare_offline_store` se borran `registry/registry.db` y `online_store/online.db` antes de correr `feast apply`. Esto garantiza que el online store siempre quede sincronizado con el parquet de la corrida actual.
-
-Sin este borrado, pueden ocurrir dos problemas encadenados:
-1. **Datos rancios en el online store:** Feast no sobreescribe entradas cuyo timestamp almacenado sea más reciente que el nuevo dato. Si una corrida anterior usó un rango de fechas más amplio (timestamps más nuevos), los valores viejos persisten aunque el parquet haya cambiado.
-2. **"no such table" en `populate_online_store`:** `feast apply` solo crea las tablas del SQLite si detecta cambios en el registry. Si el registry dice que la infraestructura ya existe, no recrea las tablas aunque el SQLite haya sido borrado — y `write_to_online_store` falla. Borrando también el registry, `feast apply` trata todo como instalación nueva y recrea las tablas correctamente.
+Lee el parquet, se queda con la última fila de cada pozo (la fila futura sin target) y la escribe en el SQLite via `write_to_online_store`. Siempre tiene exactamente una fila por pozo.
 
 ### Task 4: `split_data`
 
-Obtiene los features históricos del offline store via Feast usando `get_historical_features`, que hace un **point-in-time lookup**: para cada par `(idpozo, fecha)`, devuelve los features tal como eran en esa fecha exacta, garantizando que no hay data leakage entre el pasado y el futuro.
+Obtiene los features históricos del offline store via Feast usando `get_historical_features` (point-in-time lookup). Descarta las filas futuras y divide en train/test con split temporal: 80% fechas más antiguas como train, 20% más recientes como test.
 
-Después descarta las filas futuras (`prod_gas = None`) y divide en train/test con un **split temporal**.
-
-**Decisión de diseño — split temporal en lugar de split aleatorio:** Para series de tiempo, un split aleatorio introduce data leakage: el modelo podría entrenarse con datos de 2023 para predecir datos de 2020. El split temporal garantiza que el modelo solo ve datos pasados durante el entrenamiento. Se usa el 80% de fechas más antiguas como train y el 20% más reciente como test.
-
-**Por qué el split se hace acá y no en `train_model`:** Todos los experimentos se evalúan sobre el mismo conjunto de test. Si el split se hiciera dentro de cada `train_model`, cada experimento podría tener un test set distinto y las métricas no serían comparables.
+El split se hace acá y no en `train_model` para que todos los experimentos se evalúen sobre el mismo conjunto de test.
 
 ### Tasks 5 y 6: `train_model` y `evaluate_model`
 
-El DAG entrena **dos modelos completamente independientes**: uno para predecir `prod_gas` y otro para predecir `prod_pet`. No es un modelo que predice ambos targets a la vez. Cada modelo tiene sus propios experimentos, sus propias versiones en el Model Registry y su propio alias `production` en MLFlow.
+Entrena **dos modelos independientes**: uno para `prod_gas` y otro para `prod_pet`. El loop recorre 10 experimentos en total (5 por target), variando `n_estimators`, `max_depth` y el conjunto de features.
 
 El loop recorre **10 experimentos en total** (5 por target), todos con `RandomForestRegressor`. Cada experimento varía `n_estimators`, `max_depth` y el conjunto de features. Por cada experimento, `train_model` entrena el modelo y `evaluate_model` lo evalúa y loguea en MLFlow.
 
@@ -542,29 +545,47 @@ Model Registry:
   └── oil_gas_prod_pet → versiones 1 a 5
 ```
 
+
 ### Task 7: `select_best_model`
 
-Corre **una sola vez al final** de todos los experimentos. Consulta MLFlow, compara todas las versiones registradas de cada modelo por `r2`, y promueve la mejor usando `set_registered_model_alias` con el alias `"production"`.
+Consulta MLFlow y compara **todas las versiones históricas acumuladas** de cada modelo — no solo las de la corrida actual. Promueve la versión con mejor `r2` global con el alias `"production"`:
 
-El resultado son **dos modelos en producción**:
-- `oil_gas_prod_gas@production` → el mejor modelo para predecir gas
-- `oil_gas_prod_pet@production` → el mejor modelo para predecir petróleo
+- `oil_gas_prod_gas@production` → mejor modelo para gas
+- `oil_gas_prod_pet@production` → mejor modelo para petróleo
 
-**Decisión de diseño:** Se usa alias en lugar de stages porque `transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` permite cargar el modelo desde la API con:
+---
 
-```python
-model = mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")
-```
+## Relación entre el entrenamiento y la API
+
+El rango de fechas elegido al triggerear el DAG condiciona directamente el comportamiento de la API. Entender esta relación es clave para interpretar correctamente las respuestas del endpoint `/forecast`.
+
+Cuando el DAG corre con `date_from=2023-01-01` y `date_to=2023-12-31`:
+
+- El **parquet** contiene features históricos para todos los pozos entre enero y diciembre de 2023, más una fila futura por pozo (enero 2024) con `prod_gas = None`.
+- El **online store** queda con los features del estado más reciente de cada pozo — los correspondientes a diciembre 2023.
+- El **modelo** fue entrenado con datos de 2023.
+
+Esto define dos comportamientos en la API al momento de predecir:
+
+**Fechas dentro del período de entrenamiento (ej: 2023-03-01):** la API encuentra esa fecha en el parquet con datos reales y usa sus features. Cada mes tiene su propio `avg_prod_gas_10m` calculado con producción real, por lo que las predicciones varían mes a mes. Esto permite evaluar el comportamiento del modelo sobre datos conocidos, pero no constituye una predicción genuina del futuro.
+
+**Fechas posteriores al período de entrenamiento (ej: 2024-02-01):** la fecha no existe en el parquet (o existe como fila futura con target nulo). La API usa el online store — siempre los mismos features de diciembre 2023 — y devuelve la misma predicción para todos los meses del rango. Es el caso de uso principal del sistema: predecir producción futura a partir del estado más reciente del pozo.
+
+**Fechas anteriores al período de entrenamiento (ej: 2022-02-01):** la fecha no existe en el parquet (o existe como fila futura con target nulo). La API devuelve un error (HTTP 400) y no realiza la predicción.
+
+En resumen:
+
+| Fecha pedida | Fuente de features | Comportamiento |
+|---|---|---|
+| Anterior al período de entrenamiento | - | Error (no permitido) |
+| Dentro del período de entrenamiento | Offline store | Predicción basada en features históricos |
+| Posterior al período de entrenamiento | Online store | Predicción basada en el estado más reciente |
 
 ---
 
 ## API REST
 
-La API expone dos endpoints conforme a la especificación OpenAPI del enunciado.
-
 ### `GET /api/v1/forecast`
-
-Devuelve el pronóstico de producción de un pozo para el próximo mes.
 
 **Parámetros:**
 
@@ -575,27 +596,25 @@ Devuelve el pronóstico de producción de un pozo para el próximo mes.
 | `date_end` | string (YYYY-MM-DD) | SI | Fecha de fin del rango |
 | `target` | string | NO | `"gas"` (default) o `"pet"` |
 
-**Funcionamiento:**
-1. Genera el rango mensual entre `date_start` y `date_end` (primer día de cada mes)
-2. Para cada fecha del rango, elige la fuente de features:
-   - **Fecha dentro del parquet (histórica):** usa los features reales del offline store. `avg_prod_10m` fue calculado con `shift(1)` en `prepare_offline_store`, por lo que no contiene información de la fecha consultada ni de fechas posteriores (sin leakage)
-   - **Fecha futura (posterior al último dato del parquet):** usa los features del online store (estado más reciente del pozo). El modelo predice un solo paso; se repite la misma predicción para todos los meses futuros sin actualización autoregresiva, para evitar distribution shift en `avg_prod_10m`
-3. Devuelve un punto por cada mes del rango
+**Funcionamiento:** genera el rango mensual entre `date_start` y `date_end` y para cada mes decide la fuente de features según la tabla de la sección anterior. Devuelve un punto por cada mes del rango.
 
-**Ejemplo: rango histórico (pozo 3640, enero–junio 2023)**
-
-Los primeros dos meses tienen registros reales en el parquet; a partir de marzo el pozo ya no tiene datos y la API usa el online store repitiendo la misma predicción:
-
+**Ejemplo de respuesta — 3 meses futuros (mismo valor repetido):**
 ```json
 {
   "id_well": "3640",
   "data": [
-    { "date": "2023-01-01", "prod": 27.8  },
-    { "date": "2023-02-01", "prod": 25.02 },
-    { "date": "2023-03-01", "prod": 27.8  },
-    { "date": "2023-04-01", "prod": 27.8  },
-    { "date": "2023-05-01", "prod": 27.8  },
-    { "date": "2023-06-01", "prod": 27.8  }
+    {
+      "date": "2024-01-01",
+      "prod": 435.73
+    },
+    {
+      "date": "2024-02-01",
+      "prod": 435.73
+    },
+    {
+      "date": "2024-03-01",
+      "prod": 435.73
+    }
   ]
 }
 ```
@@ -624,26 +643,8 @@ Esto es una limitación del modelo (no del pipeline) y tiene dos causas posibles
 
 Para la entrega final se evaluará si agregar features adicionales (formación geológica, empresa operadora, ubicación) o cambiar el modelo mejora la diferenciación en inferencia futura.
 
+
 ### `GET /api/v1/wells`
 
-Devuelve el listado de pozos disponibles para una fecha dada.
-
-**Parámetros:** `date_query`
-
-**Funcionamiento:** Consulta el parquet del offline store y devuelve los pozos que tienen registros para la fecha solicitada.
-
----
-
-## MLFlow
-
-MLFlow trackea todos los experimentos con las siguientes métricas:
-
-- `mae`: Mean Absolute Error
-- `mse`: Mean Squared Error
-- `rmse`: Root Mean Squared Error
-- `r2`: R² Score
-
-Cada run tiene un nombre descriptivo que incluye el target, los estimadores, la profundidad máxima y si se usaron features completas o reducidas. Ejemplo: `prod_gas_est100_depth5_featall`.
-
-El modelo con mejor `r2` por target queda taggeado con el alias `production` en el Model Registry.
+Devuelve el listado de pozos disponibles para una fecha dada (`date_query`). La fecha debe ser el primer día del mes (ej: `2023-01-01`) y debe estar dentro del período de entrenamiento — el endpoint consulta el parquet del offline store.
 

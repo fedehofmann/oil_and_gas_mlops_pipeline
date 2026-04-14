@@ -38,12 +38,7 @@ EXPERIMENTS = [
 @dag(
     dag_id = 'ml_pipeline_oil_and_gas',
     description = 'Pipeline de Machine Learning con Airflow, MLFlow y Feature Store - Trabajo Práctico Final',
-    schedule = '0 0 1 * *', # Corre el primer día de cada mes a medianoche. El dataset es mensual
-                             # (producción por pozo por mes), por lo que el reentrenamiento mensual
-                             # es la frecuencia natural. En producción con un backend distribuido
-                             # para Feast (BigQuery, Spark), correría sobre el rango completo.
-                             # En entornos locales se recomienda triggear manualmente con date_from
-                             # y date_to para acotar el dataset y evitar OOM.
+    schedule = '0 0 1 * *', # Corre el primer día de cada mes a medianoche
     params = { # Los params permiten configurar el DAG desde la UI de Airflow sin tocar el código
         'date_from': Param(default = None, type = ['null', 'string'], description = 'Fecha inicio (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
         'date_to': Param(default = None, type = ['null', 'string'], description = 'Fecha fin (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
@@ -269,15 +264,15 @@ def ml_pipeline():
     return {
         'prod_pet': {
             'X_train': '/opt/airflow/data/splits/X_train.parquet',
-            'X_test':  '/opt/airflow/data/splits/X_test.parquet',
+            'X_test': '/opt/airflow/data/splits/X_test.parquet',
             'y_train': '/opt/airflow/data/splits/y_pet_train.parquet',
-            'y_test':  '/opt/airflow/data/splits/y_pet_test.parquet',
+            'y_test': '/opt/airflow/data/splits/y_pet_test.parquet',
         },
         'prod_gas': {
             'X_train': '/opt/airflow/data/splits/X_train.parquet',
-            'X_test':  '/opt/airflow/data/splits/X_test.parquet',
+            'X_test': '/opt/airflow/data/splits/X_test.parquet',
             'y_train': '/opt/airflow/data/splits/y_gas_train.parquet',
-            'y_test':  '/opt/airflow/data/splits/y_gas_test.parquet',
+            'y_test': '/opt/airflow/data/splits/y_gas_test.parquet',
         }
     }
   @task
@@ -298,7 +293,7 @@ def ml_pipeline():
       model_params = config['model_params']
 
       # Construimos el path del modelo en base al target y los hiperparámetros
-      model_path = f'/opt/airflow/models/model_{target}_{model_params["n_estimators"]}.pkl'
+      model_path = f'/opt/airflow/models/model_{target}_est{model_params["n_estimators"]}_depth{model_params.get("max_depth", "none")}.pkl'
 
       # Leemos los subconjuntos de train filtrando solo las features del experimento
       X_train = pd.read_parquet(splits.get(target).get('X_train'))[features]

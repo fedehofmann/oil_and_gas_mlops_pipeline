@@ -6,10 +6,11 @@ import os
 
 # -------------------- CONFIGURACIÓN --------------------
 
-# Paths al feature store y al parquet histórico dentro del contenedor Docker
+# Paths al feature store y al parquet dentro del contenedor Docker
 FEATURE_STORE_REPO = '/opt/airflow/feature_store'
 PARQUET_PATH = os.path.join(FEATURE_STORE_REPO, 'data/well_features.parquet')
 
+# FastAPI genera documentación Swagger automáticamente en /docs
 app = FastAPI(
     title = "Oil & Gas Forecast API",
     version = "1.0.0",
@@ -17,13 +18,15 @@ app = FastAPI(
 )
 
 # -------------------- ENDPOINTS --------------------
+
 @app.get("/api/v1/wells")
 def get_wells(date_query: str):
     """
     Devuelve el listado de pozos que tienen registros para la fecha dada.
-    Args: date_query (str) - fecha en formato YYYY-MM-DD.
+    La fecha debe ser el primer día del mes (ej: 2022-01-01).
     """
     try:
+        # Leemos el parquet del offline store (una fila por pozo por mes)
         df = pd.read_parquet(PARQUET_PATH)
         df['fecha'] = pd.to_datetime(df['fecha'])
         date = pd.to_datetime(date_query)
@@ -37,74 +40,80 @@ def get_wells(date_query: str):
         return [{"id_well": str(p)} for p in pozos]
 
     except HTTPException:
-        raise # Re-lanzamos para que FastAPI devuelva el código HTTP correcto
+        raise
     except Exception as e:
         raise HTTPException(status_code = 500, detail = str(e))
-
 
 @app.get("/api/v1/forecast")
 def get_forecast(id_well: str, date_start: str, date_end: str, target: str = "gas"):
     """
     Devuelve el pronóstico de producción de un pozo para cada mes entre date_start y date_end.
 
-    Estrategia de inferencia según el tipo de fecha:
-    - Fechas dentro del parquet (históricas): se usan los features reales del offline store.
-      avg_prod_10m fue calculado con shift(1) en prepare_offline_store, así que el valor
-      en la fila de fecha T contiene producción de T-10 a T-1 (sin leakage).
-    - Fechas futuras (posteriores al último dato del parquet): se usan los features del online
-      store (estado más reciente del pozo). El modelo predice un solo paso; se repite la misma
-      predicción para todos los meses futuros del rango. No se hace actualización autoregresiva
-      porque alimentar el modelo con sus propias predicciones cambia la distribución de
-      avg_prod_10m respecto al entrenamiento (distribution shift).
+        - Para fechas históricas con datos reales usa los features del offline store (parquet).
 
-    Args:
-        id_well (str) - identificador del pozo.
-        date_start (str) - fecha de inicio en formato YYYY-MM-DD.
-        date_end (str) - fecha de fin en formato YYYY-MM-DD.
-        target (str) - tipo de producción a predecir: 'gas' (default) o 'pet'.
+        - Para fechas futuras o la fila futura del parquet (target nulo) usa el online store.
+
+    No se hace actualización autoregresiva para evitar distribution shift en avg_prod_10m.
     """
     try:
         if target not in ("gas", "pet"):
             raise HTTPException(status_code = 400, detail = "target debe ser 'gas' o 'pet'")
 
-        # Columnas de features y modelo según el target
-        # Cada target usa sus propios features de ventana para evitar ruido entre variables
-        # que no siempre están correlacionadas (un pozo puede ser gasífero o petrolífero)
-        if target == "gas":
+        # Definimos la columna target y los features según el fluido a predecir
+        target_col = 'prod_gas' if target == 'gas' else 'prod_pet'
+
+        if target == "gas": # Cada target usa sus propios features de ventana porque gas y petróleo no siempre están correlacionados en pozos no convencionales
             feature_cols = ['tipoextraccion', 'tef', 'profundidad', 'prod_agua',
                             'avg_prod_gas_10m', 'last_prod_gas', 'n_readings']
+            # El alias @production apunta al modelo con mejor r2, promovido por select_best_model
             model = mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")
         else:
             feature_cols = ['tipoextraccion', 'tef', 'profundidad', 'prod_agua',
                             'avg_prod_pet_10m', 'last_prod_pet', 'n_readings']
             model = mlflow.sklearn.load_model("models:/oil_gas_prod_pet@production")
 
-        # Rango mensual (primer día de cada mes)
+        # Generamos el rango de fechas (primer día de cada mes)
         dates = pd.date_range(start = date_start, end = date_end, freq = 'MS')
         if len(dates) == 0:
             raise HTTPException(status_code = 400, detail = "date_start debe ser anterior a date_end")
 
-        # Cargamos el offline store indexado por fecha para el pozo dado
+        # Cargamos el parquet filtrado por el pozo e indexado por fecha
         df = pd.read_parquet(PARQUET_PATH)
         df['fecha'] = pd.to_datetime(df['fecha'])
-        well_df = df[df['idpozo'] == int(id_well)].set_index('fecha')
+        well_df = df[df['idpozo'] == int(id_well)].set_index('fecha') # Filtramos pozo e index de fecha
 
         if well_df.empty:
             raise HTTPException(status_code = 404, detail = f"No se encontraron datos para el pozo {id_well}")
+        
+        min_date = well_df.index.min()
+        max_date = well_df.index.max()
 
-        # Features del online store: se cargan solo si el rango incluye fechas futuras
+        # Validación temporal: no permitir fechas anteriores al histórico
+        if any(date < min_date for date in dates):
+            raise HTTPException(
+                status_code = 400,
+                detail = f"No se permiten predicciones anteriores al histórico disponible ({min_date.date()} - período de entrenamiento)"
+            )
+
+        # Se inicializa lazy: el online store solo se consulta si hay fechas futuras en el rango
         online_X = None
 
-        results = []
-        for date in dates:
-            if date in well_df.index:
-                # Fecha histórica: features reales del offline store.
-                # avg_prod_10m en la fila T = media de prod de T-10 a T-1 (shift(1) aplicado
-                # en prepare_offline_store). No hay leakage.
-                X = well_df.loc[[date], feature_cols]
+        results = [] # Por cada mes del rango hacemos results.append(...) con la fecha y la predicción
+
+        for date in dates: # Iteramos todos los meses del input
+
+            # Es histórica solo si está en el parquet Y el target no es nulo
+            is_historical = (
+                date in well_df.index and
+                pd.notna(well_df.loc[date, target_col]) # La fila futura que agrega el DAG tiene target = None — se trata como futura
+            )
+
+            if is_historical:
+                # Usamos los features reales de esa fecha del offline store
+                X = well_df.loc[[date], feature_cols] # avg_prod_10m en T = promedio de T-10 a T-1 (shift(1) — sin leakage)
             else:
-                # Fecha futura: features del online store (estado más reciente del pozo).
-                # Se reutiliza online_X para todos los meses futuros del rango.
+                # Usamos el online store: una fila por pozo con el estado más reciente
+                # Se reutiliza para todos los meses futuros del rango (lazy load)
                 if online_X is None:
                     store = FeatureStore(repo_path = FEATURE_STORE_REPO)
                     online_features = store.get_online_features(
@@ -129,7 +138,8 @@ def get_forecast(id_well: str, date_start: str, date_end: str, target: str = "ga
 
                 X = online_X
 
-            pred = max(0.0, float(model.predict(X)[0]))  # floor en 0: producción no puede ser negativa
+            # La producción no puede ser negativa, aplicamos floor en 0
+            pred = max(0.0, float(model.predict(X)[0]))
             results.append({"date": date.strftime("%Y-%m-%d"), "prod": round(pred, 2)})
 
         return {
