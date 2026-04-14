@@ -333,7 +333,15 @@ Ver [Decisiones de Diseño](#decisiones-de-diseño) para la justificación del r
 
 ## Decisiones de Diseño
 
-### 1. Rango de fechas de entrenamiento: local vs. producción
+### 1. Supuesto: los datos históricos del gobierno no se modifican retroactivamente
+
+El pipeline no hashea ni versiona el CSV descargado. El supuesto es que los datos históricos publicados por el Ministerio de Energía son inmutables una vez publicados — una fila de producción de enero 2022 no cambia en una descarga posterior.
+
+**Consecuencia:** si el gobierno corrigiera datos históricos entre dos corridas, no habría forma de detectarlo. En ese caso, dos runs con el mismo rango de fechas podrían producir modelos distintos sin advertencia.
+
+**Por qué se aceptó el supuesto:** agregar hashing del CSV introduce complejidad de infraestructura (almacenamiento de snapshots, comparación de hashes entre runs) que no está justificada mientras el supuesto se mantenga válido. Si en el futuro se detectan actualizaciones retroactivas, el punto de extensión natural es la tarea `download_dataset`.
+
+### 2. Rango de fechas de entrenamiento: local vs. producción
 
 | Contexto | Rango | Motivo |
 |---|---|---|
@@ -366,23 +374,23 @@ Los features de ventana (`avg_prod_gas_10m`, `last_prod_gas`) igualmente incorpo
 
 > **Nota:** Este contraargumento es válido para modelos de decline curve clásicos. En este trabajo se usa un modelo de ML supervisado (RandomForest), donde la heterogeneidad tecnológica entre pozos de distintas épocas introduce ruido que puede perjudicar la generalización. Se priorizó la homogeneidad del período de entrenamiento sobre la extensión del historial.
 
-### 2. Orden del filtro de fechas en `prepare_offline_store`
+### 3. Orden del filtro de fechas en `prepare_offline_store`
 
 El filtro se aplica **después** de calcular los features de ventana, no antes. Si se filtrara primero, el `avg_prod_gas_10m` de la primera fila del rango solo tendría contexto desde `date_from`, perdiendo todo el historial anterior. El orden correcto garantiza que el rolling usa el dataset completo antes de recortar.
 
-### 3. Split temporal en lugar de split aleatorio
+### 4. Split temporal en lugar de split aleatorio
 
 Para series de tiempo, un split aleatorio introduce data leakage: el modelo podría entrenarse con datos de 2023 para predecir datos anteriores. El split temporal garantiza que el modelo solo ve el pasado durante el entrenamiento (80% fechas más antiguas = train, 20% más recientes = test).
 
-### 4. `get_historical_features` de Feast para el entrenamiento
+### 5. `get_historical_features` de Feast para el entrenamiento
 
 El entrenamiento consume del feature store vía `get_historical_features`, que hace un point-in-time lookup: para cada par `(idpozo, fecha)` devuelve los features tal como eran en esa fecha, evitando data leakage entre períodos. El online store (SQLite) se usa para inferencia.
 
-### 5. Dos modelos independientes: `prod_gas` y `prod_pet`
+### 6. Dos modelos independientes: `prod_gas` y `prod_pet`
 
 En pozos no convencionales, la producción de gas y petróleo no siempre están correlacionadas — un pozo puede ser predominantemente gasífero o petrolífero según la formación geológica. Mezclar features de un fluido para predecir el otro introduciría ruido. Cada modelo tiene sus propios features de ventana, sus experimentos y su alias `production` en MLFlow.
 
-### 6. Alias `production` en lugar de stages en MLFlow
+### 7. Alias `production` en lugar de stages en MLFlow
 
 `transition_model_version_stage` está deprecado en versiones recientes de MLFlow. El alias `"production"` es el mecanismo recomendado y permite cargar el modelo con `mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")`. Si el DAG vuelve a correr y encuentra un modelo mejor, el alias se mueve automáticamente — la API siempre sirve el mejor modelo sin cambiar el código. `select_best_model` compara solo las versiones generadas en la corrida actual — ver decisión #8.
 
@@ -398,7 +406,7 @@ En pozos no convencionales, la producción de gas y petróleo no siempre están 
 
 **Separación de responsabilidades:** `select_best_model` elige el mejor modelo *de esta corrida*. Si ese modelo degrada respecto al ciclo anterior, el model decay report (pendiente) lo detecta y alerta. Son dos preguntas distintas que no deben mezclarse en la misma función.
 
-### 7. Predicción autoregresiva descartada en la API
+### 9. Predicción autoregresiva descartada en la API
 
 Para fechas futuras la API repite la misma predicción en lugar de actualizar `avg_prod_10m` con valores predichos. Alimentar el modelo con sus propias predicciones cambiaría la distribución del feature respecto al entrenamiento (distribution shift). En pozos shale con decline pronunciado, el error se autocorrelacionaría. Repetir la predicción del estado más reciente es más honesto respecto a las limitaciones de un modelo single-step.
 
