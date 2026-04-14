@@ -406,11 +406,17 @@ def ml_pipeline():
                 description = f"Predice producción mensual de {fluid} (m³) por pozo. Entrenado con RandomForestRegressor sobre datos del MINEM (producción no convencional). Features: {feat_list}."
             )
 
+        return {"target": results['target'], "run_id": run_id}
+
   @task
-  def select_best_model():
+  def select_best_model(eval_results):
     """
-    Consulta MLflow, compara todos los modelos registrados por target (prod_gas y prod_pet)
-    y promueve a Production el que tenga mejor r2 en cada caso.
+    Recibe los run_ids de los experimentos del DAG actual, compara solo esas versiones
+    por target (prod_gas y prod_pet) y promueve a Production la de mejor r2.
+
+    Filtra por run_id para que el resultado sea determinístico e independiente del
+    historial acumulado en MLflow: dos instancias distintas (ej: distintos colaboradores)
+    llegan al mismo ganador si corrieron el DAG con los mismos datos.
     """
     import mlflow
     from mlflow.tracking import MlflowClient
@@ -420,8 +426,12 @@ def ml_pipeline():
     for target in ['prod_gas', 'prod_pet']:
         model_name = f"oil_gas_{target}"
 
-        # Obtenemos todas las versiones del modelo registrado
+        # Filtramos solo los run_ids del DAG actual para este target
+        current_run_ids = {r['run_id'] for r in eval_results if r['target'] == target}
+
+        # Obtenemos todas las versiones del modelo registrado y filtramos por corrida actual
         versions = client.search_model_versions(f"name = '{model_name}'")
+        versions = [v for v in versions if v.run_id in current_run_ids]
 
         if not versions:
             print(f"No hay versiones registradas para {model_name}")
@@ -478,14 +488,17 @@ def ml_pipeline():
 
   # Loop sobre los experimentos encadenados en serie
   prev_task = splits
+  eval_results = []
   for exp in EXPERIMENTS:
       result = train_model(splits = splits, config = exp) # Entrena el modelo con la config del experimento
       eval_result = evaluate_model(result, splits) # Evalúa y loguea métricas en MLflow
       prev_task >> result >> eval_result # Encadena en serie: el anterior termina antes de que arranque el siguiente
       prev_task = eval_result # El próximo experimento arranca cuando este termina
+      eval_results.append(eval_result) # Acumulamos el run_id de cada experimento
 
   # Una vez terminados todos los experimentos, seleccionamos el mejor modelo
-  best_model = select_best_model()
+  # Pasamos los run_ids del DAG actual para que compare solo versiones de esta corrida
+  best_model = select_best_model(eval_results)
   prev_task >> best_model
 
 ml_pipeline()
