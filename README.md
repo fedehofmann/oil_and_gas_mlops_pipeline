@@ -26,7 +26,7 @@ El dataset proviene del [Ministerio de Energía de Argentina](http://datos.energ
 | `last_prod_pet` | Numérica | Feature calculado — ídem para petróleo |
 | `n_readings` | Entera | Feature calculado — cantidad de lecturas acumuladas del pozo (proxy de madurez) |
 
-Se recomienda filtrar el dataset a partir de 2021 pasando `date_from=2021-01-01` al triggerear el DAG, para excluir la distorsión de COVID-19 (2020) y la heterogeneidad tecnológica de pozos anteriores a la maduración de Vaca Muerta. El filtro no es automático — ver [Cómo reproducir el entrenamiento](#cómo-reproducir-el-entrenamiento) para los rangos recomendados según el entorno.
+Se recomienda filtrar el dataset a partir de 2021 pasando `date_from=` al triggerear el DAG, para excluir la distorsión de COVID-19 (2020) y la heterogeneidad tecnológica de pozos anteriores a la maduración de Vaca Muerta. El filtro no es automático — ver [Cómo reproducir el entrenamiento](#cómo-reproducir-el-entrenamiento) para los rangos recomendados según el entorno.
 
 ### Modelo y métricas
 
