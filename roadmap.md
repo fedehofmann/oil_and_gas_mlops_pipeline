@@ -198,3 +198,13 @@ def get_forecast(
 ```
 
 Una línea por parámetro. El Swagger UI refleja los cambios automáticamente.
+
+---
+
+### 13. Integrar el segundo dataset del RFC (listado de pozos)
+
+**Origen:** RFC — "Datasets a Utilizar" especifica dos fuentes; solo se usa una actualmente.
+
+**Problema:** El dataset de metadata de pozos (empresa operadora, formación geológica, cuenca, coordenadas) no está integrado. Esto tiene dos consecuencias: (1) incumplimiento parcial del RFC, y (2) el modelo no puede diferenciar pozos por sus características estructurales, lo que contribuye a la convergencia a la media documentada en inferencia futura.
+
+**Implementación:** En `download_dataset`, descargar también el segundo CSV (`energia_cbfa4d79-ffb3-4096-bab5-eb0dde9a8385`). En `prepare_offline_store`, hacer un join por `idpozo` para agregar columnas de metadata estática — candidatas: `formprod` (formación productiva), `cuenca`, `empresa`. Estas columnas pasan al feature store como features estáticos del pozo y quedan disponibles tanto en el offline store (entrenamiento) como en el online store (inferencia futura).
