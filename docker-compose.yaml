@@ -95,9 +95,7 @@ services:
 
   api:
     image: python:3.11-slim
-    command: >
-      bash -c "pip install fastapi uvicorn feast pandas mlflow scikit-learn pyarrow &&
-               uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
+    command: bash -c "pip install fastapi uvicorn feast==0.47.0 pandas mlflow scikit-learn pyarrow && uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
     ports:
       - "8000:8000" # Swagger disponible en localhost:8000/docs
     volumes:
