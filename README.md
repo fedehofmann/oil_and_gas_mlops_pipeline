@@ -325,7 +325,7 @@ Desde la UI de Airflow en http://localhost:8080, triggerear el DAG `ml_pipeline_
 - `date_from`: fecha de inicio del rango de entrenamiento (formato `YYYY-MM-DD`)
 - `date_to`: fecha de fin del rango de entrenamiento (formato `YYYY-MM-DD`)
 
-**En entorno local se recomienda usar un rango de un año**, por ejemplo `2023-01-01` / `2023-12-31`. `get_historical_features` de Feast carga el parquet completo en memoria para el point-in-time join — con 9 contenedores corriendo el worker dispone de ~1.5-2GB libres, insuficientes para más de un año de datos. Sin fechas, el DAG intenta procesar el dataset completo y falla por OOM.
+El DAG puede correr con el dataset completo (sin especificar fechas), pero **se recomienda acotar el rango según la memoria disponible**. `get_historical_features` de Feast carga el parquet completo en memoria para el point-in-time join — si el worker no tiene suficiente RAM, el DAG falla con OOM (Out of Memory). Un año de datos es un punto de partida razonable para entornos con recursos limitados. El rango exacto depende de la memoria disponible en el entorno donde corra el pipeline.
 
 Ver [Decisiones de Diseño](#decisiones-de-diseño) para la justificación del rango recomendado.
 
@@ -337,8 +337,8 @@ Ver [Decisiones de Diseño](#decisiones-de-diseño) para la justificación del r
 
 | Contexto | Rango | Motivo |
 |---|---|---|
-| **Entorno local** | `2023-01-01` / `2023-12-31` | `get_historical_features` de Feast carga el parquet completo en memoria para el point-in-time join. Con 9 contenedores corriendo, el worker dispone de ~1.5-2GB libres — insuficientes para más de un año de datos |
-| **Producción** | `2021-01-01` / `2023-12-31` | Con un backend distribuido (BigQuery, Spark), Feast puede manejar el dataset completo sin OOM (Out of Memory: error que ocurre cuando un proceso intenta usar más RAM de la disponible) |
+| **Entorno con recursos limitados** (ej: laptop con 9 contenedores corriendo) | `2023-01-01` / `2023-12-31` | `get_historical_features` carga el parquet completo en memoria. Con ~1.5-2GB libres disponibles, un año de datos es lo que entra sin OOM. El rango exacto varía según la RAM del entorno |
+| **Producción / entorno con más recursos** | `2021-01-01` / hasta la fecha más reciente disponible | Con más memoria o un backend distribuido (BigQuery, Spark), Feast puede manejar el dataset completo sin OOM |
 
 **Por qué 2021 como inicio en producción y no antes:** 2020 fue atípico por COVID-19 (caída de producción documentada en 14 países). A partir de 2021 Vaca Muerta retomó crecimiento sostenido. Además, las técnicas de completación cambiaron radicalmente entre 2012 y 2021 (de 1.500 a 2.500 lb de proppant por pie; costos de USD 20M a USD 11M por pozo), por lo que datos de pozos anteriores representan una realidad operativa distinta e introducen ruido.
 
