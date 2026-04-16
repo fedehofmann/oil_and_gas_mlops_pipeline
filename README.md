@@ -342,6 +342,14 @@ En pozos no convencionales, la producción de gas y petróleo no siempre están 
 
 Para fechas futuras la API repite la misma predicción en lugar de actualizar `avg_prod_10m` con valores predichos. Alimentar el modelo con sus propias predicciones cambiaría la distribución del feature respecto al entrenamiento (distribution shift). En pozos shale con decline pronunciado, el error se autocorrelacionaría.
 
+### 9. Alineación entre entrenamiento e inferencia
+
+El modelo se entrena con features del mes T para predecir el target del mes T — por ejemplo, los features de marzo 2023 predicen la producción de marzo 2023. En inferencia, en cambio, se usan los features del último mes conocido (T) para predecir el mes siguiente (T+1).
+
+Esta asimetría significa que el modelo nunca aprendió explícitamente la relación T→T+1, sino T→T. La inferencia asume que el estado del mes más reciente es un proxy suficientemente bueno para predecir el mes siguiente — lo cual es razonable dado el comportamiento relativamente estable de la producción mensual en pozos no convencionales, pero es una limitación conocida del pipeline.
+
+Para resolverlo correctamente habría que entrenar con features de T y target de T+1, alineando el entrenamiento con el caso de uso real de inferencia.
+
 ---
 
 ## Feature Store
