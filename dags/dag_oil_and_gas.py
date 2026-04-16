@@ -145,12 +145,8 @@ def ml_pipeline():
     # Guardamos el DataFrame en formato parquet
     offline_feat_df.to_parquet(offline_parquet_path, index = False)
 
-    # Borramos el registry y el SQLite antes de feast apply para garantizar consistencia
-    # con el parquet actual. Feast no sobreescribe entradas del online store cuyo timestamp
-    # sea más reciente que el nuevo dato. Además, feast apply solo crea las tablas del
-    # online store si detecta cambios en el registry — si el registry existe y dice que
-    # la infraestructura ya está creada, no recrea las tablas aunque el SQLite no exista.
-    # Borrando ambos forzamos una instalación limpia en cada corrida del DAG.
+    # Feast no sobreescribe entradas con timestamp más viejo ni recrea tablas si el registry ya existe
+    # Borramos ambos para forzar una instalación limpia en cada corrida
     for path in [
         os.path.join(feature_store_repo, 'online_store/online.db'),
         os.path.join(feature_store_repo, 'registry/registry.db'),
