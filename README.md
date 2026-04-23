@@ -490,7 +490,7 @@ El DAG expone el param `exclude_years` con default `[2020]`. Los años listados 
 
 **Por qué `exclude_years` y no `date_from=2021-01-01`:** filtrar 2020 específicamente preserva los años anteriores (2019, 2018, etc.), que representan régimen operativo normal y aportan señal válida para el entrenamiento. Cambiar el `date_from` a 2021 descartaría años válidos pre-COVID por igual, eligiendo un cutoff arbitrario en lugar de excluir lo anómalo.
 
-El default es overridable: sobreescribir a `[]` al triggerear el DAG incluye 2020 en el entrenamiento, útil para análisis de robustez. Si aparecieran otros años atípicos, se agregan a la misma lista sin tocar código — por ejemplo, `[2020, 2022]` excluiría ambos años.
+El default es overridable: dejar el campo vacío (null) al triggerear el DAG incluye 2020 en el entrenamiento, útil para análisis de robustez. Si aparecieran otros años atípicos, se agregan a la misma lista sin tocar código — por ejemplo, `[2020, 2022]` excluiría ambos años.
 
 **Limitación actual de memoria:** `get_historical_features` de Feast y `RandomForestRegressor.fit()` cargan el dataset completo en RAM, por lo que entrenar con más de ~1 año de datos en un entorno local puede producir OOM. El camino para levantar esta limitación es migrar el entrenamiento a un esquema de incremental learning con memoria constante (`partial_fit` en chunks, ej. `SGDRegressor` o XGBoost con warm start entre batches), de forma que el uso de RAM quede acotado por el tamaño del batch y no por el total del dataset. Ver [issue #18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18).
 
