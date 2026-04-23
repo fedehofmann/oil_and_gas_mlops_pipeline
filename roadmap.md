@@ -8,13 +8,12 @@
 | 2 | #7 Model decay report + #8 Threshold configurable | Obligatorios. Van en el mismo PR |
 | 3 | #18 Segundo dataset del RFC (metadata de pozos) | Quasi-obligatorio. Afecta el feature store — conviene integrarlo antes de que los quick wins reflejen el feature set definitivo |
 | 4 | #9 Evaluación desagregada + #10 Feature importance | Quick wins. Tocan la misma función (`evaluate_model`) — mismo PR |
-| 5 | #12 CSV hash | Quick win. Una línea en `download_dataset` |
-| 6 | #16 CI/CD | En este punto el código está estabilizado y los tests cubren algo real. Los PRs siguientes sirven como demostración del flujo completo |
-| 7 | #11 OpenAPI descriptions | Quick win. Solo en `main.py`, no toca el DAG |
-| 8 | #13 LabelEncoder como artefacto | Deuda técnica. Modifica `train_model` y la API |
-| 9 | #14 Validación de schema | Deuda técnica. Modifica `download_dataset` |
-| 10 | #15 Prediction logging | Deuda técnica. Solo en `main.py` |
-| 11 | #17 Point-in-Time | El más complejo arquitecturalmente. Solo si hay tiempo |
+| 5 | #16 CI/CD | En este punto el código está estabilizado y los tests cubren algo real. Los PRs siguientes sirven como demostración del flujo completo |
+| 6 | #11 OpenAPI descriptions | Quick win. Solo en `main.py`, no toca el DAG |
+| 7 | #13 LabelEncoder como artefacto | Deuda técnica. Modifica `train_model` y la API |
+| 8 | #14 Validación de schema | Deuda técnica. Modifica `download_dataset` |
+| 9 | #15 Prediction logging | Deuda técnica. Solo en `main.py` |
+| 10 | #17 Point-in-Time | El más complejo arquitecturalmente. Solo si hay tiempo |
 
 ---
 
@@ -100,9 +99,9 @@ Estos ítems no son requisitos obligatorios pero cierran deudas documentadas en 
 
 **Origen:** Clase 2 (linaje de datos / reproducibilidad)
 
-**Problema:** El pilar Datos de la triada de reproducibilidad está roto: no hay forma de saber qué versión del CSV generó un modelo específico en producción.
+**Estado en esta entrega:** No se implementa. El issue [#12](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/12) quedó cerrado apoyándose en el supuesto de inmutabilidad del dataset histórico del gobierno (documentado en el README, aceptado por el docente).
 
-**Implementación:** En la tarea `download_dataset`, calcular el MD5 del archivo descargado y loguearlo como parámetro en el run de MLFlow (`mlflow.log_param("dataset_hash", md5)`). Cada versión del modelo quedaría vinculada a un hash concreto del dataset.
+**Pendiente para producción a escala:** Si el dataset upstream pasara a mutar entre snapshots, o si se quisiera reproducir versiones antiguas con garantía fuerte de linaje de datos, habría que calcular el MD5 del CSV descargado en `download_dataset` y loguearlo como parámetro en el run de MLFlow (`mlflow.log_param("dataset_hash", md5)`). Así cada versión del modelo quedaría vinculada a un hash concreto del dataset, cerrando el pilar Datos de la triada de reproducibilidad.
 
 ---
 
