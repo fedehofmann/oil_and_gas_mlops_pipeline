@@ -494,6 +494,16 @@ El default es overridable: dejar el campo vacío (null) al triggerear el DAG inc
 
 **Limitación actual de memoria:** `get_historical_features` de Feast y `RandomForestRegressor.fit()` cargan el dataset completo en RAM, por lo que entrenar con más de ~1 año de datos en un entorno local puede producir OOM. El camino para levantar esta limitación es migrar el entrenamiento a un esquema de incremental learning con memoria constante (`partial_fit` en chunks, ej. `SGDRegressor` o XGBoost con warm start entre batches), de forma que el uso de RAM quede acotado por el tamaño del batch y no por el total del dataset. Ver [issue #18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18).
 
+**Interacción con la fila futura del online store:** `prepare_offline_store` agrega, después de aplicar los filtros (`date_from`, `date_to`, `exclude_years`), una fila futura por pozo calculada como `tail(1) + 1 mes` sobre el dataset ya filtrado. Esa fila es la que el online store sirve para inferencia del mes siguiente. Como se genera sobre el dataset post-filtro, `exclude_years` puede desplazar la fecha de la fila futura de un pozo hacia un año anterior al excluido. Ejemplos:
+
+- **Pozo con histórico completo 2018–junio 2020.** Sin filtro, su fila futura queda en julio 2020. Con `exclude_years=[2020]`, su último mes post-filtro es diciembre 2019 y la fila futura cae en enero 2020.
+- **Pozo con gap (datos hasta octubre 2019 y luego 2020).** Con `exclude_years=[2020]`, el último mes post-filtro es octubre 2019 y la fila futura cae en noviembre 2019 — un año antes que en el run sin filtro.
+- **Pozo que dejó de reportar en 2019.** La fila futura cae en 2019 tanto con filtro como sin filtro; el filtro no cambia nada para este pozo.
+
+Esto es coherente con la semántica del filtro: si excluimos un año porque no es representativo del régimen operativo, no tiene sentido que la predicción futura del pozo apunte a un mes de ese año excluido. La fila futura se alinea con el último mes "válido" según el filtro, no con el último mes en bruto del CSV.
+
+**Consecuencia práctica al comparar runs con distintos `exclude_years`:** el conteo de filas por año no coincide exactamente incluso en años no filtrados, porque algunas filas futuras cambian de año entre runs. Es un artefacto esperado del orden filtro → fila futura, no un bug. En la validación de este PR, la diferencia de 1 fila entre runs en el año 2019 se explicó exactamente por este motivo (un pozo con data en 2020 cuya fila futura pasó de caer en julio 2020 a caer en enero 2020 al activar el filtro).
+
 ---
 
 ## Feature Store
