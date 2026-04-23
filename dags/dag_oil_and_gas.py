@@ -42,7 +42,7 @@ EXPERIMENTS = [
     params = { # Los params permiten configurar el DAG desde la UI de Airflow sin tocar el código
         'date_from': Param(default = None, type = ['null', 'string'], description = 'Fecha inicio (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
         'date_to': Param(default = None, type = ['null', 'string'], description = 'Fecha fin (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
-        'exclude_years': Param(default = [2020], type = ['null', 'array'], items = {'type': 'integer'}, description = 'Lista opcional de años a excluir del entrenamiento por ser atípicos. Formato: [2020] para un año, [2020, 2022] para varios, o dejar el campo vacío (null) para no excluir ninguno. Default [2020]: COVID-19 distorsionó la producción del sector. Ver Decisiones de diseño en README.'),
+        'exclude_years': Param(default = [2020], type = ['null', 'array'], items = {'type': 'integer'}, description = 'Años a excluir del entrenamiento por ser atípicos. Default [2020]: excluye el año distorsionado por COVID-19. Para excluir varios años, listarlos separados por coma (ej. [2020, 2022] excluye 2020 y 2022, no el rango entre ambos). Dejar vacío para no excluir ninguno. Ver Decisiones de diseño en README.'),
     }
 )
 def ml_pipeline():
