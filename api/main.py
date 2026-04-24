@@ -4,6 +4,7 @@ from ray import serve
 import mlflow.sklearn
 import pandas as pd
 import os
+import time
 
 # -------------------- CONFIGURACIÓN --------------------
 
@@ -178,3 +179,15 @@ class APIDeployment:
 
 # Entry point para `serve run api.main:app_deployment`
 app_deployment = APIDeployment.bind()
+
+
+# Entry point alternativo para `python -m api.main` (usado desde docker-compose).
+# Evita la dependencia en los flags del CLI `serve run`, que cambian entre versiones.
+if __name__ == "__main__":
+    serve.start(http_options = {"host": "0.0.0.0", "port": 8000})
+    serve.run(app_deployment)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        serve.shutdown()
