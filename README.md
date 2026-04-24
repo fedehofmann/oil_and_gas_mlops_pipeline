@@ -281,6 +281,7 @@ El sistema tarda aproximadamente 2-3 minutos en estar completamente operativo.
 | Airflow UI | http://localhost:8080 | airflow / airflow |
 | MLFlow UI | http://localhost:9090 | - |
 | API Swagger | http://localhost:8000/docs | - |
+| Ray Dashboard | http://localhost:8265 | - |
 
 ### 9. Nota sobre MLFlow y seguridad de red
 
@@ -349,6 +350,42 @@ El modelo se entrena con features del mes T para predecir el target del mes T �
 Esta asimetría significa que el modelo nunca aprendió explícitamente la relación T→T+1, sino T→T. La inferencia asume que el estado del mes más reciente es un proxy suficientemente bueno para predecir el mes siguiente — lo cual es razonable dado el comportamiento relativamente estable de la producción mensual en pozos no convencionales, pero es una limitación conocida del pipeline.
 
 Para resolverlo correctamente habría que entrenar con features de T y target de T+1, alineando el entrenamiento con el caso de uso real de inferencia.
+
+### 10. Arquitectura de serving: Ray Serve con FastAPI y deployment unificado
+
+**Contexto:** la API de inferencia corría como un único proceso `uvicorn` sin escalado horizontal y cargaba los modelos desde MLFlow en **cada request**. Eso acumula dos problemas: imposibilidad de escalar para atender picos de demanda, y latencia inflada por recargar el modelo en cada llamada.
+
+**Framework elegido: Ray Serve con FastAPI como ingress.** Ray Serve permite escalado horizontal declarativo (réplicas + balanceo) sin salir del ecosistema Python. Se envuelve la `app` de FastAPI existente con `@serve.ingress(app)`, preservando el contrato público (endpoints, query params, Swagger en `/docs`) y permitiendo a los consumidores seguir usando la API sin cambios. Alternativas descartadas: `uvicorn --workers` (escala procesos pero no resuelve el costo de cargar el modelo por request), TensorFlow Serving (fuerza formato TF y agrega un lenguaje distinto), SageMaker / Vertex AI (serving cloud gestionado, fuera del alcance de un TP local).
+
+**Deployment unificado con ambos modelos en la misma clase.** La clase `APIDeployment` carga en `__init__` tanto el modelo de gas como el de petróleo, y despacha según el param `target` del request. La alternativa era dos deployments separados (uno por target). Se descarta esta última por:
+
+1. **Eficiencia de memoria.** El overhead fijo de cada réplica de Ray Serve (≈100 MB por scheduler, proxy y state) domina sobre el tamaño de cada modelo `RandomForest` (≈20-50 MB). Con deployment unificado y 2 réplicas total quedan 2 workers; con 2 deployments × 2 réplicas c/u serían 4 workers → más memoria sin beneficio de capacidad. En un entorno con 9 contenedores compartiendo RAM, el ahorro importa.
+2. **Ausencia de evidencia empírica de asimetría de carga gas/pet.** Separar deployments tiene sentido cuando los targets tienen patrones de demanda muy distintos (uno saturado, el otro ocioso). Hoy no hay forma de medir eso: la API no tiene prediction log persistente (ver pendiente relacionado con monitoreo de producción). La distribución del dataset sugiere más pozos gasíferos que petrolíferos, pero es un proxy del dominio, no del uso real.
+3. **Simplicidad operativa.** Un único deployment tiene un único ciclo de vida, una única config de réplicas, un único lugar donde revisar logs y métricas.
+
+Si en el futuro el prediction log muestra asimetría sostenida (≥3× de tráfico en un target, o latencia p95 degradada en uno mientras el otro tiene capacidad ociosa), se separa en dos deployments con handles independientes.
+
+**Configuración inicial:**
+
+- `num_replicas=2`. Dos réplicas permiten paralelizar inferencia y tolerar la caída de una sin quedarse sin servicio, sin saturar la memoria del host local.
+- `max_queued_requests=30`. Sin este límite, bajo carga alta Ray encola requests indefinidamente: el servicio nunca devuelve error pero la latencia p95 se degrada a segundos. Con el límite, cuando la cola se llena el servicio responde `503` a los requests excedentes, preservando latencia para los que sí entran. Es un trade-off deliberado entre latencia y tasa de error bajo pico.
+- **Modelos cargados una vez por réplica en `__init__`.** El `mlflow.sklearn.load_model(...)` se ejecuta al crear la réplica, no por request. Además del escalado, esto elimina por sí solo el overhead de recarga que tenía la implementación previa.
+- **Feature store client (`FeatureStore`) también inicializado una vez por réplica**, por el mismo motivo.
+
+**SLA objetivo** (validado por load test):
+
+| Escenario | Objetivo |
+|---|---|
+| Carga normal (50 req/s, 5s) | p95 < 500 ms, error rate 0 % |
+| Pico (140 req/s, 5s) | p95 controlado por `max_queued_requests` |
+| Pico sostenido (140 req/s, 30s) | Throughput ≥ 100 req/s exitosos, sin colapso por cola infinita |
+
+**Observabilidad:** Ray expone un dashboard en el puerto `8265` (`http://localhost:8265`) con métricas por deployment y por réplica (req/s, latencia, estado, logs). Es el canal para detectar más adelante la asimetría de carga gas/pet que hoy no se puede medir.
+
+**Trade-offs pendientes de evaluar con datos reales:**
+
+- Réplicas fijas vs. autoscaling dinámico con `autoscaling_config` de Ray: simplicidad y predictibilidad frente a elasticidad bajo demanda variable. Hoy no hay data suficiente para justificar autoscaling; queda como posible evolución.
+- Cache de inferencia (ej. Redis) para queries repetitivas de los mismos pozos: optimización posible si el tráfico real muestra concentración en pocos pozos "hot". Actualmente no se implementa.
 
 ---
 
