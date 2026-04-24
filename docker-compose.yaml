@@ -95,10 +95,9 @@ services:
 
   api:
     image: python:3.11-slim
-    command: bash -c "pip install fastapi feast==0.47.0 pandas mlflow scikit-learn pyarrow 'ray[serve,default]' && python -m api.main"
+    command: bash -c "pip install fastapi feast==0.47.0 pandas mlflow scikit-learn pyarrow 'ray[serve]' && python -m api.main"
     ports:
       - "8000:8000" # Swagger disponible en localhost:8000/docs
-      - "8265:8265" # Ray Dashboard (métricas de deployments y réplicas)
     volumes:
       - ./feature_store:/opt/airflow/feature_store
       - ./mlruns:/mlflow/mlruns

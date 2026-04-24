@@ -281,7 +281,6 @@ El sistema tarda aproximadamente 2-3 minutos en estar completamente operativo.
 | Airflow UI | http://localhost:8080 | airflow / airflow |
 | MLFlow UI | http://localhost:9090 | - |
 | API Swagger | http://localhost:8000/docs | - |
-| Ray Dashboard | http://localhost:8265 | - |
 
 ### 9. Nota sobre MLFlow y seguridad de red
 
@@ -462,14 +461,9 @@ El "parcial" del último escenario no refleja una falla del diseño: ocurre por 
 
 #### Observabilidad
 
-Ray expone un dashboard en [http://localhost:8265](http://localhost:8265) con métricas por deployment y por réplica (req/s, latencia, estado, logs). Se habilita inicializando Ray explícitamente antes de `serve.start()`:
+Ray expone un dashboard nativo en el puerto `8265` con métricas por deployment y por réplica. Se habilita inicializando Ray explícitamente antes de `serve.start()` con `ray.init(dashboard_host="0.0.0.0", include_dashboard=True)` y usando la instalación `ray[serve,default]` (el extra `default` trae las dependencias del UI).
 
-```python
-ray.init(dashboard_host="0.0.0.0", dashboard_port=8265, include_dashboard=True)
-serve.start(http_options={"host": "0.0.0.0", "port": 8000})
-```
-
-La instalación del container usa `ray[serve,default]` para incluir las dependencias del dashboard UI (el extra `default` trae `aiohttp`, `prometheus_client` y demás que el dashboard necesita).
+**No está habilitado en este despliegue local.** El overhead de memoria del dashboard (proceso de Ray Dashboard + métricas + deps adicionales) sumado al de `num_replicas=2` excede la RAM disponible en esta configuración de Docker Desktop y empuja a Ray a un loop de crash por OOM. El dashboard queda disponible en el código como opción, comentado; habilitarlo requiere entornos con más recursos o bajar a `num_replicas=1`.
 
 El script [`api/load_test.py`](api/load_test.py) permite reproducir los tres escenarios de carga (baseline, pico, pico sostenido) para medir regresiones o cambios de configuración contra el mismo baseline.
 
