@@ -462,7 +462,14 @@ El "parcial" del último escenario no refleja una falla del diseño: ocurre por 
 
 #### Observabilidad
 
-Ray expone un dashboard en `http://localhost:8265` con métricas por deployment y por réplica. Cuando Ray se arranca programáticamente con `serve.start()` el dashboard no queda habilitado por default; habilitarlo requiere inicializar con `ray.init(dashboard_host="0.0.0.0")`, mejora que queda como follow-up de observabilidad.
+Ray expone un dashboard en [http://localhost:8265](http://localhost:8265) con métricas por deployment y por réplica (req/s, latencia, estado, logs). Se habilita inicializando Ray explícitamente antes de `serve.start()`:
+
+```python
+ray.init(dashboard_host="0.0.0.0", dashboard_port=8265, include_dashboard=True)
+serve.start(http_options={"host": "0.0.0.0", "port": 8000})
+```
+
+La instalación del container usa `ray[serve,default]` para incluir las dependencias del dashboard UI (el extra `default` trae `aiohttp`, `prometheus_client` y demás que el dashboard necesita).
 
 El script [`api/load_test.py`](api/load_test.py) permite reproducir los tres escenarios de carga (baseline, pico, pico sostenido) para medir regresiones o cambios de configuración contra el mismo baseline.
 

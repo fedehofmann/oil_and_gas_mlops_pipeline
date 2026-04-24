@@ -4,6 +4,7 @@ from ray import serve
 import mlflow.sklearn
 import pandas as pd
 import os
+import ray
 import time
 
 # -------------------- CONFIGURACIÓN --------------------
@@ -184,6 +185,9 @@ app_deployment = APIDeployment.bind()
 # Entry point alternativo para `python -m api.main` (usado desde docker-compose).
 # Evita la dependencia en los flags del CLI `serve run`, que cambian entre versiones.
 if __name__ == "__main__":
+    # Inicializamos Ray explícitamente con el dashboard habilitado en el puerto 8265.
+    # Si no se hace antes de serve.start(), el dashboard queda deshabilitado por default.
+    ray.init(dashboard_host = "0.0.0.0", dashboard_port = 8265, include_dashboard = True)
     serve.start(http_options = {"host": "0.0.0.0", "port": 8000})
     serve.run(app_deployment)
     try:
