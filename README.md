@@ -10,10 +10,10 @@ Dado el historial de producción de un pozo, predecir cuántos m³ de gas o petr
 
 ### Datos
 
-El RFC especifica dos datasets del [Ministerio de Energía de Argentina](http://datos.energia.gob.ar):
+El RFC lista dos datasets del [Ministerio de Energía de Argentina](http://datos.energia.gob.ar):
 
-- **Dataset 1 — Producción por pozo** en uso: lecturas mensuales de producción de gas, petróleo y agua por pozo no convencional.
-- **Dataset 2 — Listado de pozos** pendiente de integración: metadata extra por pozo (empresa operadora, formación geológica, cuenca, coordenadas) que no está disponible en el Dataset 1. Su integración mejoraría la capacidad predictiva del modelo, pero queda fuera del scope de este trabajo: el foco está en la arquitectura MLOps que mantiene el modelo productivo, no en optimizar el modelo en sí.
+- **Dataset 1 — Producción por pozo** (en uso): lecturas mensuales de producción de gas, petróleo y agua por pozo no convencional. Es el dataset principal que alimenta el pipeline.
+- **Dataset 2 — Listado de pozos** (información complementaria según el RFC, no obligatorio): metadata estática por pozo (empresa operadora, formación geológica, cuenca, coordenadas). Su integración sumaría features estructurales al modelo, pero el RFC lo marca explícitamente como *"información complementaria"* y el foco del trabajo es la arquitectura MLOps, no optimizar la precisión del modelo.
 
 Las variables principales del Dataset 1 son:
 
