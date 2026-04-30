@@ -350,6 +350,137 @@ Esta asimetría significa que el modelo nunca aprendió explícitamente la relac
 
 Para resolverlo correctamente habría que entrenar con features de T y target de T+1, alineando el entrenamiento con el caso de uso real de inferencia.
 
+### 10. Arquitectura de serving: Ray Serve con FastAPI
+
+La inferencia del modelo debe responder a consultas externas con latencia acotada, escalar ante picos de demanda, tolerar la caída de una instancia sin perder servicio, y no pagar el costo de cargar el modelo desde MLFlow en cada request. La implementación más simple (un proceso uvicorn único) no provee ninguna de esas propiedades. Se necesita un framework que separe el servidor HTTP del ciclo de vida del modelo, permita escalado horizontal declarativo, y gestione fallos automáticamente.
+
+#### Qué es Ray Serve y por qué se eligió
+
+[Ray Serve](https://docs.ray.io/en/latest/serve/index.html) es un framework de model serving distribuido construido sobre Ray Core. Su arquitectura interna tiene tres tipos de actores:
+
+- **Controller:** actor global del plano de control. Crea, actualiza y destruye réplicas, y corre el autoscaler. Es el componente responsable de la fault tolerance: si una réplica muere, el Controller la recrea automáticamente.
+- **HTTP Proxy:** actores que reciben el tráfico entrante y lo enrutan a las réplicas con round-robin y backpressure. Se pueden correr uno por nodo para alta disponibilidad.
+- **Replicas:** actores que ejecutan el código del deployment — en este proyecto, los que cargan los modelos y corren la inferencia.
+
+Se eligió Ray Serve sobre alternativas por dos razones concretas:
+
+1. **Integración con FastAPI preservando el contrato público.** `@serve.ingress(app)` envuelve la `app` de FastAPI: los endpoints, query params, validación de tipos y Swagger siguen funcionando sin modificación del cliente. Otras alternativas fuerzan cambios: TensorFlow Serving obliga al formato TF y a un protocolo específico, Triton requiere un modelo repository con convenciones rígidas, SageMaker / Vertex AI son gestionados cloud (fuera del alcance local).
+2. **Escalado horizontal declarativo.** Aumentar capacidad es una línea: `num_replicas=N` o un bloque de `autoscaling_config`. No hay que reescribir la API ni tocar el cliente.
+
+#### Cómo está implementado en este proyecto
+
+La clase [`APIDeployment`](api/main.py) está decorada con `@serve.deployment(...)` + `@serve.ingress(app)`:
+
+- **`__init__` carga el estado pesado una sola vez por réplica**: ambos modelos desde MLFlow (`oil_gas_prod_gas@production` y `oil_gas_prod_pet@production`) y el cliente de Feast. El `mlflow.sklearn.load_model(...)` ocurre al crear la réplica — nunca dentro del handler. Esto desacopla el costo de carga del costo por request.
+- **Los handlers** (`get_wells`, `get_forecast`) son métodos de la clase y consumen `self.model_gas`, `self.model_pet`, `self.store`.
+- **Arranque programático** en `if __name__ == "__main__"`: `serve.start(http_options={...})` + `serve.run(app_deployment)`. Docker ejecuta `python -m api.main`. Se evita depender del CLI `serve run`, cuyos flags de host/port cambian entre versiones de Ray.
+
+#### Cómo cumple estándares de escalabilidad
+
+| Propiedad | Implementación en este proyecto |
+|---|---|
+| **Escalado horizontal** | `num_replicas` declarativo. Réplicas stateless (cualquiera atiende cualquier request). Escalable sin cambios en el cliente. |
+| **Load balancing automático** | El HTTP Proxy distribuye requests en round-robin entre réplicas, respetando `max_ongoing_requests` por réplica (backpressure a nivel de handle). |
+| **Graceful degradation** | `max_queued_requests=30` hace que, bajo saturación, Ray rechace nuevos requests con `503` en vez de dejarlos en cola infinita. Preserva la latencia de los que sí entran y acota el tiempo máximo de espera. |
+| **Fault tolerance** | El Controller monitorea el estado de las réplicas y las recrea automáticamente si mueren. Observado empíricamente en el escenario sostenido del load test: Ray mató workers por OOM y los reemplazó. |
+| **Autoscaling disponible** | Sustituir `num_replicas=N` por `autoscaling_config={min,max,target}` habilita escalado reactivo a carga observada. No se implementa ahora (ver [#28](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/28)) pero el código está preparado para activarlo sin rediseño. |
+| **Observabilidad nativa** | Ray expone un dashboard con métricas por deployment y por réplica (req/s, latencia, estado, logs) en el puerto `8265`. Diagnóstico in situ sin instrumentación adicional. |
+| **Inmutabilidad** | El deployment es una clase serializable con estado inicializado en `__init__`. Cualquier cambio crea una nueva versión del deployment; no hay mutación de estado en runtime. Alineado con el principio de "contenedores y modelos inmutables en producción". |
+
+#### Dos dimensiones de escalado: réplicas y deployments
+
+Ray Serve permite escalar en **dos dimensiones independientes** que es importante no mezclar:
+
+- **Réplicas (`num_replicas`)**: cuántas **copias del mismo deployment** corren en paralelo. Cada réplica es un worker independiente con su propio estado inicializado en `__init__`. El HTTP Proxy distribuye los requests entre ellas. Agregar réplicas aumenta paralelismo y tolerancia a fallos — si una cae, las otras siguen atendiendo.
+
+- **Deployments separados**: **clases distintas** de deployment, cada una con su propio ciclo de vida y su propio pool de réplicas. Se usan cuando los componentes son lógicamente diferentes (ej. clasificación vs. ranking), o cuando se quiere escalar cada pool de forma independiente.
+
+Para este proyecto la pregunta concreta es: tenemos dos modelos (gas y petróleo) → ¿un único deployment unificado que carga ambos, o dos deployments separados?
+
+#### Decisión: deployment unificado con `num_replicas=2`
+
+Comparando las tres arquitecturas candidatas, con memoria estimada (≈100 MB de overhead por réplica de Ray + ≈30 MB por modelo `RandomForest`):
+
+| Arquitectura | Workers | Memoria aprox. | Paralelismo efectivo |
+|---|---|---|---|
+| **Unificado, `num_replicas=2` (elegida)** | 2 | 2 × (100 + 60) = **320 MB** | 2 requests en paralelo de cualquier combinación de fluidos |
+| Separado, 1 réplica por fluido | 2 | 2 × (100 + 30) = **260 MB** | 1 request de gas + 1 de petróleo simultáneos, no balanceable entre sí |
+| Separado, 2 réplicas por fluido | 4 | 4 × (100 + 30) = **520 MB** | 4 requests (2 por fluido), balanceados solo dentro de cada fluido |
+
+**Por qué `num_replicas=2` unificado es el punto óptimo**:
+
+1. **Por qué no 1 réplica unificada.** Con una sola réplica se pierde *fault tolerance*: si muere (OOM, excepción, deploy), el servicio queda caído hasta que el Controller la recree. Con 2 réplicas, mientras una se recrea la otra sigue atendiendo. El costo de esta garantía es ≈160 MB adicionales — es el costo de tener alta disponibilidad.
+2. **Por qué no separar en dos deployments.**
+   - **Separado con 1 réplica por fluido (260 MB, el más chico)**: pierde balanceo entre fluidos. Si llegan 2 requests de gas simultáneos, el único worker de gas se satura aunque el worker de petróleo esté ocioso. Unificado los distribuye.
+   - **Separado con 2 réplicas por fluido (520 MB)**: la alternativa más cara. Duplica la memoria sin beneficio claro **mientras no haya evidencia de asimetría de carga sostenida entre gas y petróleo**. Esa evidencia requeriría prediction logging persistente, todavía no implementado. Decidir separar sin esa data sería especulativo — criterio para re-evaluar documentado en [#26](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/26).
+3. **Por qué no más de 2 réplicas unificadas.** En este entorno local, con 9 containers compartiendo la RAM de la VM de Docker, no hay headroom para una tercera réplica sin empujar al OOM — el load test ya muestra OOM con 2. En un entorno productivo con recursos adecuados, escalar a 3+ es simplemente subir el valor del param.
+
+La elección unificado + 2 réplicas es entonces el **punto óptimo entre memoria, paralelismo y disponibilidad** dadas las restricciones reales del entorno, y se mantiene abierto el camino para reconfigurarlo data-driven cuando haya evidencia real.
+
+#### Configuración elegida
+
+- `num_replicas=2`. Justificación arriba.
+- `max_queued_requests=30`. Sin este límite, bajo carga alta Ray encola requests indefinidamente: el servicio nunca devuelve error pero la latencia p95 se degrada a segundos y el tiempo máximo de espera no está acotado. Con el límite, cuando la cola se llena el servicio responde `503` a los requests excedentes, preservando latencia para los que sí entran. Es un trade-off deliberado entre latencia y tasa de error bajo pico — en la industria del serving se le llama *graceful degradation*.
+- **Modelos y feature store cargados una vez por réplica en `__init__`** — desacopla costo de carga del costo por request.
+
+#### SLAs: dos niveles
+
+El sistema se diseñó con dos SLAs en mente, porque el objetivo del TP (mostrar el diseño) y las mediciones empíricas (limitadas por el entorno local) requieren diferenciarse.
+
+**SLA productivo esperado — industria oil & gas**
+
+El perfil de uso de este modelo **no** es real-time user-facing. Los consumidores típicos son:
+
+- **Analistas de producción** consultando pronósticos mensuales ocasionalmente → latencia p95 < 2 s aceptable, < 5 s tolerable.
+- **Dashboards de BI y reportes de operaciones** (actualización horaria o diaria) → latencia no crítica, throughput sostenido bajo.
+- **Sistemas de planificación operacional y allocation** (integración batch o scheduled) → throughput sobre latencia.
+
+El volumen de tráfico sostenido en una operadora mediana es bajo (unidades de req/s), con picos esporádicos al cerrar mes o generar reportes. Difiere radicalmente de IoT industrial real-time, donde la [literatura sugiere SLAs de 100-500 ms](https://dspace.networks.imdea.org/bitstream/handle/20.500.12761/1958/Exploring_the_Boundaries_of_On_Device_Inference__When_Tiny_Falls_Short__Go_Hierarchical%20(1).pdf?sequence=1) porque alimentan loops de control cerrado. Aquí la inferencia alimenta decisiones humanas con horizonte mensual: la latencia tolerable es órdenes de magnitud mayor.
+
+Target productivo razonable:
+
+| Métrica | Objetivo productivo |
+|---|---|
+| Latencia p95 | < 2 s |
+| Throughput sostenido | ≥ 100 req/s |
+| Disponibilidad | ≥ 99,5 % |
+| Error rate en operación normal | < 1 % |
+
+**SLA adaptado al entorno local (el que efectivamente validamos)**
+
+Los recursos disponibles (Mac Intel, Docker Desktop con RAM limitada, 9 containers compartiendo CPU) no permiten cumplir el SLA productivo. El objetivo del SLA local es distinto: **demostrar que el diseño se comporta coherentemente bajo carga y protege al sistema del colapso**, no alcanzar métricas productivas absolutas.
+
+| Métrica | Objetivo local | Resultado observado | ✓/✗ |
+|---|---|---|---|
+| Throughput sostenido (carga baseline 50 req/s) | ≥ 20 req/s exitosos | 26,4 req/s | ✓ |
+| Latencia p95 en baseline | < 3 s | 2,7 s | ✓ |
+| Rechazo controlado bajo pico (140 req/s, 5 s) | `503` por cola llena, sin colapso | 398 × `503` esperados | ✓ |
+| Degradación manejada bajo pico sostenido (140 req/s, 30 s) | Servicio sigue respondiendo | Servicio disponible pero con OOM (268 × `500`) | parcial |
+
+El "parcial" del último escenario no refleja una falla del diseño: ocurre por presión de memoria del entorno local (Ray mata réplicas por OOM y no alcanza a recrearlas a tiempo bajo carga sostenida). En producción con recursos adecuados por réplica no debería reproducirse — el *fault tolerance* de Ray Serve recupera las réplicas, pero necesita tiempo y headroom de memoria para hacerlo.
+
+#### Observabilidad
+
+Ray expone un dashboard nativo en el puerto `8265` con métricas por deployment y por réplica. Se habilita inicializando Ray explícitamente antes de `serve.start()` con `ray.init(dashboard_host="0.0.0.0", include_dashboard=True)` y usando la instalación `ray[serve,default]` (el extra `default` trae las dependencias del UI).
+
+**No está habilitado en este despliegue local.** El overhead de memoria del dashboard (proceso de Ray Dashboard + métricas + deps adicionales) sumado al de `num_replicas=2` excede la RAM disponible en esta configuración de Docker Desktop y empuja a Ray a un loop de crash por OOM. El dashboard queda disponible en el código como opción, comentado; habilitarlo requiere entornos con más recursos o bajar a `num_replicas=1`.
+
+El script [`api/load_test.py`](api/load_test.py) permite reproducir los tres escenarios de carga (baseline, pico, pico sostenido) para medir regresiones o cambios de configuración contra el mismo baseline.
+
+#### Trade-offs pendientes de evaluar con datos reales
+
+- **Réplicas fijas vs. autoscaling dinámico** con `autoscaling_config`: simplicidad y predictibilidad frente a elasticidad bajo demanda variable — [#28](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/28).
+- **Cache de inferencia** (ej. Redis) para queries repetitivas sobre los mismos pozos — [#27](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/27).
+- **Separación de deployments gas / petróleo** si el prediction log muestra asimetría de carga sostenida — [#26](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/26).
+
+#### Referencias
+
+- [Ray Serve Architecture](https://docs.ray.io/en/latest/serve/architecture.html) — componentes del runtime (Controller, HTTP Proxy, Replicas) y mecanismos de escalado horizontal.
+- [Ray Serve Autoscaling Guide](https://docs.ray.io/en/latest/serve/autoscaling-guide.html) — política de autoscaling reactivo basada en métricas del deployment handle.
+- [Ray Serve — Scalable and Programmable Serving](https://docs.ray.io/en/latest/serve/index.html) — integración con FastAPI, composición de deployments, features de alto nivel.
+- [IMDEA Networks — Exploring the Boundaries of On-Device Inference (2024)](https://dspace.networks.imdea.org/bitstream/handle/20.500.12761/1958/Exploring_the_Boundaries_of_On_Device_Inference__When_Tiny_Falls_Short__Go_Hierarchical%20(1).pdf?sequence=1) — latencias típicas en ML inference para casos IoT industrial (100-500 ms), útil para ubicar dónde ese rango aplica y dónde el caso de uso admite latencias mayores.
+- [MLSysBook — Benchmarking in Performance Engineering](https://mlsysbook.ai/contents/core/benchmarking/benchmarking.html) — estándares de benchmarking (p50, p95, p99) y definición de SLAs para sistemas de ML en producción.
+
 ---
 
 ## Feature Store
