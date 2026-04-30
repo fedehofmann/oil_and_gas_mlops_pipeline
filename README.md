@@ -31,7 +31,7 @@ Las variables principales del Dataset 1 son:
 | `last_prod_pet` | Numérica | Feature calculado — ídem para petróleo |
 | `n_readings` | Entera | Feature calculado — cantidad de lecturas acumuladas del pozo (proxy de madurez) |
 
-Se recomienda filtrar el dataset a partir de 2021 pasando `date_from=` al triggerear el DAG, para excluir la distorsión de COVID-19 (2020) y la heterogeneidad tecnológica de pozos anteriores a la maduración de Vaca Muerta. El filtro no es automático — ver [Cómo reproducir el entrenamiento](#cómo-reproducir-el-entrenamiento) para los rangos recomendados según el entorno.
+El DAG excluye automáticamente el año 2020 del entrenamiento (param `exclude_years=[2020]` por default) para evitar la distorsión de COVID-19 — ver [Decisiones de diseño](#decisiones-de-diseño). El filtro es overridable al triggerear el DAG. La heterogeneidad tecnológica de pozos anteriores a la maduración de Vaca Muerta queda como consideración adicional de calidad de datos en [Cómo reproducir el entrenamiento](#cómo-reproducir-el-entrenamiento).
 
 ### Modelo y métricas
 
@@ -294,15 +294,16 @@ Desde la UI de Airflow en http://localhost:8080, triggerear el DAG `ml_pipeline_
 
 - `date_from`: fecha de inicio del rango de entrenamiento (formato `YYYY-MM-DD`)
 - `date_to`: fecha de fin del rango de entrenamiento (formato `YYYY-MM-DD`)
+- `exclude_years`: lista de años a excluir del entrenamiento. Default `[2020]` (COVID-19). Ver [Decisiones de diseño](#decisiones-de-diseño).
 
-El DAG puede correr con el dataset completo (sin especificar fechas), pero se recomienda acotar el rango según la memoria disponible. `get_historical_features` de Feast carga el parquet en memoria para el point-in-time join — con recursos limitados el DAG puede fallar con OOM.
+El DAG puede correr con el dataset completo (sin especificar `date_from`/`date_to`), pero se recomienda acotar el rango según la memoria disponible. `get_historical_features` de Feast carga el parquet en memoria para el point-in-time join — con recursos limitados el DAG puede fallar con OOM.
 
 | Contexto | Rango | Motivo |
 |---|---|---|
 | **Entorno local** (laptop con 9 contenedores) | `2023-01-01` / `2023-12-31` | Con ~1.5-2GB libres disponibles, un año de datos es lo que entra sin OOM |
-| **Producción** | `2021-01-01` / hasta la fecha más reciente | Con más memoria o backend distribuido (BigQuery, Spark), Feast puede manejar el dataset completo |
+| **Producción** | Sin filtro de fechas / hasta la fecha más reciente | Con más memoria o backend distribuido (BigQuery, Spark), Feast puede manejar el dataset completo. 2020 ya queda excluido por `exclude_years` |
 
-**Por qué 2021 como inicio:** 2020 fue atípico por COVID-19. A partir de 2021 Vaca Muerta retomó crecimiento sostenido. Además, las técnicas de completación cambiaron radicalmente entre 2012 y 2021 (de 1.500 a 2.500 lb de proppant por pie), por lo que datos anteriores representan una realidad operativa distinta que introduce ruido.
+Las técnicas de completación en Vaca Muerta cambiaron radicalmente entre 2012 y 2021 (de 1.500 a 2.500 lb de proppant por pie). Datos de pozos anteriores a la maduración del yacimiento representan una realidad operativa distinta que puede introducir ruido, por lo que conviene acotar `date_from` a partir de ~2019 o posterior. Esto no es parte del filtro automático: es una recomendación de calidad de datos.
 
 **Importante:** el rango de fechas elegido condiciona el comportamiento posterior de la API. Ver [Relación entre el entrenamiento y la API](#relación-entre-el-entrenamiento-y-la-api).
 
@@ -480,6 +481,28 @@ El script [`api/load_test.py`](api/load_test.py) permite reproducir los tres esc
 - [Ray Serve — Scalable and Programmable Serving](https://docs.ray.io/en/latest/serve/index.html) — integración con FastAPI, composición de deployments, features de alto nivel.
 - [IMDEA Networks — Exploring the Boundaries of On-Device Inference (2024)](https://dspace.networks.imdea.org/bitstream/handle/20.500.12761/1958/Exploring_the_Boundaries_of_On_Device_Inference__When_Tiny_Falls_Short__Go_Hierarchical%20(1).pdf?sequence=1) — latencias típicas en ML inference para casos IoT industrial (100-500 ms), útil para ubicar dónde ese rango aplica y dónde el caso de uso admite latencias mayores.
 - [MLSysBook — Benchmarking in Performance Engineering](https://mlsysbook.ai/contents/core/benchmarking/benchmarking.html) — estándares de benchmarking (p50, p95, p99) y definición de SLAs para sistemas de ML en producción.
+
+### 11. Exclusión automática de años atípicos del entrenamiento
+
+El DAG expone el param `exclude_years` con default `[2020]`. Los años listados se filtran del dataset después de calcular los features de ventana (mismo orden que `date_from` / `date_to`) para preservar el contexto histórico del rolling.
+
+**Por qué 2020:** fue un año atípico por COVID-19. La caída de producción de petróleo y gas está documentada en múltiples países productores entre enero 2020 y diciembre 2021. Entrenar con 2020 mezclaría un régimen operativo excepcional (shut-ins, caída de demanda, precios negativos del crudo) con el régimen normal que el modelo debe predecir, introduciendo ruido que perjudica la generalización.
+
+**Por qué `exclude_years` y no `date_from=2021-01-01`:** filtrar 2020 específicamente preserva los años anteriores (2019, 2018, etc.), que representan régimen operativo normal y aportan señal válida para el entrenamiento. Cambiar el `date_from` a 2021 descartaría años válidos pre-COVID por igual, eligiendo un cutoff arbitrario en lugar de excluir lo anómalo.
+
+El default es overridable: dejar el campo vacío (null) al triggerear el DAG incluye 2020 en el entrenamiento, útil para análisis de robustez. Si aparecieran otros años atípicos, se agregan a la misma lista sin tocar código — por ejemplo, `[2020, 2022]` excluiría ambos años.
+
+**Limitación actual de memoria:** `get_historical_features` de Feast y `RandomForestRegressor.fit()` cargan el dataset completo en RAM, por lo que entrenar con más de ~1 año de datos en un entorno local puede producir OOM. El camino para levantar esta limitación es migrar el entrenamiento a un esquema de incremental learning con memoria constante (`partial_fit` en chunks, ej. `SGDRegressor` o XGBoost con warm start entre batches), de forma que el uso de RAM quede acotado por el tamaño del batch y no por el total del dataset. Ver [issue #18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18).
+
+**Interacción con la fila futura del online store:** `prepare_offline_store` agrega, después de aplicar los filtros (`date_from`, `date_to`, `exclude_years`), una fila futura por pozo calculada como `tail(1) + 1 mes` sobre el dataset ya filtrado. Esa fila es la que el online store sirve para inferencia del mes siguiente. Como se genera sobre el dataset post-filtro, `exclude_years` puede desplazar la fecha de la fila futura de un pozo hacia un año anterior al excluido. Ejemplos:
+
+- **Pozo con histórico completo 2018–junio 2020.** Sin filtro, su fila futura queda en julio 2020. Con `exclude_years=[2020]`, su último mes post-filtro es diciembre 2019 y la fila futura cae en enero 2020.
+- **Pozo con gap (datos hasta octubre 2019 y luego 2020).** Con `exclude_years=[2020]`, el último mes post-filtro es octubre 2019 y la fila futura cae en noviembre 2019 — un año antes que en el run sin filtro.
+- **Pozo que dejó de reportar en 2019.** La fila futura cae en 2019 tanto con filtro como sin filtro; el filtro no cambia nada para este pozo.
+
+Esto es coherente con la semántica del filtro: si excluimos un año porque no es representativo del régimen operativo, no tiene sentido que la predicción futura del pozo apunte a un mes de ese año excluido. La fila futura se alinea con el último mes "válido" según el filtro, no con el último mes en bruto del CSV.
+
+**Consecuencia práctica al comparar runs con distintos `exclude_years`:** el conteo de filas por año no coincide exactamente incluso en años no filtrados, porque algunas filas futuras cambian de año entre runs. Es un artefacto esperado del orden filtro → fila futura, no un bug. En la validación de este PR, la diferencia de 1 fila entre runs en el año 2019 se explicó exactamente por este motivo (un pozo con data en 2020 cuya fila futura pasó de caer en julio 2020 a caer en enero 2020 al activar el filtro).
 
 ---
 

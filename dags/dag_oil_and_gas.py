@@ -42,6 +42,7 @@ EXPERIMENTS = [
     params = { # Los params permiten configurar el DAG desde la UI de Airflow sin tocar el código
         'date_from': Param(default = None, type = ['null', 'string'], description = 'Fecha inicio (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
         'date_to': Param(default = None, type = ['null', 'string'], description = 'Fecha fin (YYYY-MM-DD). Si es None, usa todos los datos disponibles.'),
+        'exclude_years': Param(default = [2020], type = ['null', 'array'], items = {'type': 'integer'}, description = 'Años a excluir del entrenamiento por ser atípicos. Default [2020]: excluye el año distorsionado por COVID-19. Para excluir varios años, listarlos separados por coma (ej. [2020, 2022] excluye 2020 y 2022, no el rango entre ambos). Dejar vacío para no excluir ninguno. Ver Decisiones de diseño en README.'),
     }
 )
 def ml_pipeline():
@@ -84,6 +85,7 @@ def ml_pipeline():
     params = context['params']
     date_from = params.get('date_from')
     date_to = params.get('date_to')
+    exclude_years = params.get('exclude_years') or []
 
     df = pd.read_csv(read_csv_path)
     
@@ -125,6 +127,8 @@ def ml_pipeline():
         df = df[df['fecha'] >= date_from].reset_index(drop = True)
     if date_to:
         df = df[df['fecha'] <= date_to].reset_index(drop = True)
+    if exclude_years:
+        df = df[~df['fecha'].dt.year.isin(exclude_years)].reset_index(drop = True)
 
     # Generamos la fila futura por pozo para el online store (sin target)
     future = (df.groupby('idpozo').tail(1).copy()
