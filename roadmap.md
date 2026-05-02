@@ -12,7 +12,7 @@
 | ✅ Mergeado | #29 Ray Serve (cubre #6 obligatorio) | 2026-04-30 | `num_replicas=2` unificado |
 | ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
 | 🔄 En curso | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-04-30 | Rama `feature/model-decay-monitor` |
-| ⏳ Pendiente | Incremental learning (issue a crear) | - | Resuelve OOM en training |
+| ⏳ Pendiente | Incremental learning (#36) | - | Migrar RandomForest → XGBoost con training en chunks. Resuelve OOM en training y habilita entrenar con histórico completo. |
 | ⏳ Pendiente | #18 Segundo dataset del RFC | - | Información complementaria, no obligatorio |
 | ⏳ Pendiente | #9 + #10 Quick wins (eval desagregada + feature importance) | - | Mismo PR, toca `evaluate_model` |
 | ⏳ Pendiente | #16 CI/CD básico | - | GitHub Actions con tests + lint |
@@ -281,7 +281,7 @@ Reemplaza el filtro manual por un param `exclude_years=[2020]` por default. **De
    - **Mitigado con:** decay temporal explícito (siguiente decisión).
 
 2. **Sumar decay temporal real (delta R² entre runs).**
-   - **Origen:** Clari cuestionó si un threshold absoluto de R² cubría "decay" o solo "calidad". Distinción válida.
+   - **Evolución del razonamiento:** la primera versión del monitor tenía solo un threshold absoluto sobre R² (`R² < 0.85` → alerta de calidad). Al revisar el alcance, se identificó que ese threshold detecta "modelo malo" pero no "modelo que se degradó" — y el RFC pide específicamente *decay*, que es un concepto temporal: comparar performance actual contra performance esperada/anterior.
    - **Decisión:** agregar comparación `r2_actual - r2_anterior` leyendo del Model Registry, que ya persiste todas las versiones. No requiere persistencia adicional.
    - **Cómo identificar la versión "anterior":** filtrar versiones cuyo `run_id` no esté en `current_run_ids` (los del DAG actual) y tomar la más reciente.
 
@@ -436,7 +436,42 @@ PSI es el threshold estándar de la industria (PSI < 0.1 sin drift, 0.1-0.25 mod
 
 #### Issues abiertas a tomar en orden
 
-1. **Incremental learning con memoria constante** (issue a crear). Resuelve el OOM estructural de training (`get_historical_features` + `RandomForestRegressor.fit` cargan todo en RAM). Migrar a `partial_fit` en chunks (ej. `SGDRegressor` o XGBoost con warm start) acotaría el uso de RAM al tamaño del batch. Habilita entrenar con histórico completo.
+1. **Incremental learning con memoria acotada — migrar RandomForest → XGBoost ([#36](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/36)).**
+
+    **Problema actual:** `RandomForestRegressor.fit()` carga el dataset completo en RAM. Esto limita el rango de fechas con el que se puede entrenar localmente a aproximadamente 1 año. Para histórico completo (~2019 en adelante) rompe por OOM. La limitación es **estructural al algoritmo**, no de implementación: Random Forest es un *bagging ensemble* donde cada árbol se entrena sobre un bootstrap sample del dataset completo, por lo que necesita acceso simultáneo a toda la data al armar cada árbol. No tiene `partial_fit` y no puede tenerlo.
+
+    **Por qué el cambio resuelve el OOM:** XGBoost es un *gradient boosting ensemble* construido secuencialmente. Cada árbol nuevo aprende del **error residual** del modelo anterior, no del dataset original. Esa propiedad permite agregar árboles al final de un modelo previo entrenando solo con un chunk nuevo de datos: el batch actual + el modelo previo (chico) son todo lo que necesita en RAM en cada paso.
+
+    **Cuenta de memoria:**
+
+    | Esquema | Memoria peak | Limitante |
+    |---|---|---|
+    | RF + dataset completo (actual) | `sizeof(dataset) + sizeof(modelo) ≈ 5 GB + 50 MB` | Si el dataset > RAM → OOM, sin escape posible. |
+    | XGBoost incremental por chunks | `sizeof(chunk) + sizeof(modelo_creciente) ≈ 500 MB + ~10 MB` | Acotada por `chunk_size`, independiente del dataset total. |
+
+    **Aclaración importante:** la mejora de memoria viene de **dos cambios juntos**, no del modelo solo. Cambiar a XGBoost sin iterar el dataset (`xgb.fit(dataset_completo)`) reproduciría la misma OOM. Lo que reduce memoria es la combinación de:
+
+    1. Un algoritmo que soporta continuación de entrenamiento (XGBoost via `xgb_model` parameter, o SGDRegressor via `partial_fit`).
+    2. Un loop de entrenamiento que itera el dataset por batches en lugar de pasarlo entero.
+
+    **Por qué XGBoost sobre SGDRegressor:** SGDRegressor también soporta `partial_fit` y mantiene memoria estrictamente constante. Pero es un modelo lineal — pierde la capacidad de capturar relaciones no-lineales entre features (rolling means, profundidad, tipoextraccion). El proyecto perdería capacidad predictiva. XGBoost preserva la capacidad no-lineal de los árboles y eso es más valioso que la diferencia marginal de memoria entre los dos esquemas (en ambos casos la memoria queda acotada por chunk).
+
+    **Trade-offs aceptados:**
+    - El modelo crece linealmente con la cantidad de chunks (cada chunk agrega árboles), pero el crecimiento está acotado: con `max_depth=6` y 100 árboles totales el booster pesa < 10 MB.
+    - Hiperparámetros distintos. `n_estimators` en XGBoost incremental significa "árboles a agregar por chunk", no el total — pitfall a tener mapeado.
+    - La API de inferencia (`api/main.py`) tiene que migrar de `mlflow.sklearn.load_model` a `mlflow.xgboost.load_model`.
+
+    **Lo que NO resuelve este issue:**
+    - El OOM de `prepare_offline_store` (carga del CSV completo + groupby + rolling). Eso es un cuello de botella separado, antes del training. Issue futura: refactorear ese task a procesamiento por chunks o usar Dask/Polars.
+    - El OOM de presión total de containers (Ray Serve + entrenamientos + Evidently). Ese se resuelve con más RAM en Docker Desktop o bajando `num_replicas` de Ray Serve.
+
+    **Decisiones técnicas tomadas en la planificación** (todas en el issue #36):
+    - Versión: `xgboost==3.2.0`, sklearn-style API (`XGBRegressor.fit(X, y, xgb_model=prev_path)`).
+    - Logueo en MLFlow: `mlflow.xgboost.log_model(model_format="ubj")` — formato nativo, no pickle (más portable, preserva metadata categórica).
+    - `learning_rate = 0.1` (default 0.3 es agresivo para incremental).
+    - Chunks **mensuales** y orden **temporal** (no shuffle): coherente con el split temporal del DAG y con el caso de uso de inferencia (predecir mes siguiente, los meses recientes pesan más).
+    - **Mantener `LabelEncoder`** para `tipoextraccion` por ahora; migrar a `enable_categorical=True` queda para un PR aparte.
+    - **Issue #13 (LabelEncoder como artefacto)** queda separado: ya tiene su propio scope.
 2. **#18 Segundo dataset del RFC** (información complementaria, no obligatorio).
 3. **#9 + #10** Quick wins de evaluación desagregada y feature importance (mismo PR, toca `evaluate_model`).
 4. **#16 CI/CD básico** con GitHub Actions: tests + lint + validación de schema de `features.py`.
