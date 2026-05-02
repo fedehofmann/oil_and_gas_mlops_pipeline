@@ -55,14 +55,24 @@ def ml_pipeline():
     """
     Descarga un dataset CSV desde una URL y lo guarda en disco.
 
+    Usa streaming directo a disco (urllib + chunks) en lugar de pd.read_csv(url) +
+    df.to_csv() para evitar cargar el CSV completo en memoria. Es importante en este
+    entorno: el worker container ya tiene huella alta por las deps de Evidently
+    (matplotlib, plotly, dask, statsmodels) y mantener el dataset en RAM puede
+    desbordar el límite de Docker Desktop con OOM.
+
     Args: url (str) - URL de descarga, save_path (str) - ruta local del archivo.
     Retorna: la ruta del archivo guardado.
     """
-    # Creamos la carpeta en disco (Docker)
+    import urllib.request
+    import shutil
+
     os.makedirs(os.path.dirname(save_path), exist_ok = True)
 
-    df = pd.read_csv(url)
-    df.to_csv(save_path, index = False)
+    # Streaming: copia chunks directo de la respuesta HTTP al archivo en disco
+    with urllib.request.urlopen(url) as response, open(save_path, 'wb') as out_file:
+        shutil.copyfileobj(response, out_file)
+
     return save_path
 
   @task
@@ -456,6 +466,164 @@ def ml_pipeline():
         )
         print(f"Modelo {model_name} v{best_version} promovido a Production (r2 = {best_r2:.4f})")
 
+  @task
+  def monitor_model(eval_results, splits):
+    """
+    Genera un reporte de Evidently AI por cada modelo promovido a producción y compara
+    su R² contra el del modelo que estaba en producción antes de este run del DAG.
+
+    Para cada target (prod_gas, prod_pet):
+      - Carga el modelo con alias `production` desde MLFlow.
+      - Construye reference = dataset de train y current = dataset de test, ambos con
+        predicciones del modelo, y corre RegressionPreset + DataDriftPreset.
+      - Loguea métricas clave en el run del modelo en producción:
+          * monitor_r2 (R² en current)
+          * monitor_drift_share (% de features con drift entre train y test)
+          * monitor_r2_delta (R² actual menos R² del último production anterior, si existe)
+      - Emite warning en el log de Airflow si:
+          * R² < MODEL_QUALITY_R2_FLOOR (calidad mínima del modelo en datos recientes)
+          * drift_share > MODEL_DECAY_DRIFT_SHARE_THRESHOLD (data drift severo)
+          * monitor_r2_delta < -MODEL_DECAY_R2_DELTA (decay temporal vs. run anterior)
+        Las alertas son blandas: no abortan el DAG, solo dejan trazas visibles.
+
+    Args: eval_results (list) - run_ids de los experimentos del DAG actual, usado para
+                                identificar la versión "anterior" en el Model Registry.
+          splits (dict) - paths a los parquets de cada subconjunto train/test.
+    """
+    import logging
+    import mlflow
+    import mlflow.sklearn
+    from mlflow.tracking import MlflowClient
+    from evidently.report import Report
+    from evidently.metric_preset import RegressionPreset, DataDriftPreset
+    from evidently.pipeline.column_mapping import ColumnMapping
+
+    log = logging.getLogger(__name__)
+    r2_floor = float(os.getenv('MODEL_QUALITY_R2_FLOOR', '0.85'))
+    drift_threshold = float(os.getenv('MODEL_DECAY_DRIFT_SHARE_THRESHOLD', '0.5'))
+    r2_delta_threshold = float(os.getenv('MODEL_DECAY_R2_DELTA', '0.05'))
+    client = MlflowClient()
+
+    # Run_ids del DAG actual: las versiones del Model Registry creadas en este DAG
+    # llevan estos run_ids. Para encontrar la versión "anterior" filtramos por las que NO los tienen.
+    current_run_ids = {r['run_id'] for r in eval_results}
+
+    report_dir = '/opt/airflow/data/monitoring'
+    os.makedirs(report_dir, exist_ok = True)
+
+    for target in ['prod_gas', 'prod_pet']:
+        model_name = f"oil_gas_{target}"
+
+        # Cargamos el modelo promovido a producción y leemos sus features
+        # feature_names_in_ está disponible en sklearn 1.0+ y refleja las columnas usadas en fit
+        loaded_model = mlflow.sklearn.load_model(f"models:/{model_name}@production")
+        features = list(loaded_model.feature_names_in_)
+
+        # Leemos splits restringidos a las features del modelo
+        target_splits = splits[target]
+        X_train = pd.read_parquet(target_splits['X_train'])[features]
+        X_test = pd.read_parquet(target_splits['X_test'])[features]
+        y_train = pd.read_parquet(target_splits['y_train']).squeeze()
+        y_test = pd.read_parquet(target_splits['y_test']).squeeze()
+
+        # Construimos reference y current con target + prediction (formato esperado por Evidently)
+        ref_df = X_train.assign(target = y_train.values, prediction = loaded_model.predict(X_train))
+        cur_df = X_test.assign(target = y_test.values, prediction = loaded_model.predict(X_test))
+
+        # Column mapping: tipoextraccion es la única categórica (encodada con LabelEncoder)
+        column_mapping = ColumnMapping(
+            target = 'target',
+            prediction = 'prediction',
+            numerical_features = [c for c in features if c != 'tipoextraccion'],
+            categorical_features = [c for c in features if c == 'tipoextraccion'],
+        )
+
+        # Generamos el reporte combinado: regression performance + data drift.
+        # Stattest elegidos: tests basados en magnitud, no en significancia estadística.
+        # Razón: tests de hipótesis (KS, chi-square con p-value) son ultra-sensibles al
+        # tamaño de muestra — con miles de filas detectan cualquier diferencia minúscula
+        # como "drift". Tests de magnitud (PSI, Jensen-Shannon) miden cuánto cambió la
+        # distribución, no si el cambio es estadísticamente significativo, y por eso
+        # no escalan mal con el tamaño del sample.
+        #   - Numéricas: PSI (Population Stability Index) con threshold 0.1.
+        #     Threshold de la industria: PSI < 0.1 sin drift, 0.1-0.25 moderado, > 0.25 severo.
+        #     Mismo enfoque propuesto originalmente en el roadmap del proyecto.
+        #   - Categóricas: Jensen-Shannon distance con threshold 0.1.
+        #     Análogo a PSI pero para variables categóricas; threshold consistente.
+        report = Report(metrics = [
+            RegressionPreset(),
+            DataDriftPreset(
+                num_stattest = 'psi', num_stattest_threshold = 0.1,
+                cat_stattest = 'jensenshannon', cat_stattest_threshold = 0.1,
+            ),
+        ])
+        report.run(reference_data = ref_df, current_data = cur_df, column_mapping = column_mapping)
+
+        report_path = os.path.join(report_dir, f'monitor_{target}.html')
+        report.save_html(report_path)
+
+        # Extraemos métricas del reporte. Tres niveles:
+        #   - r2: regression performance global (current).
+        #   - drift_share: % agregado de features con drift (alerta global).
+        #   - column_drift_scores: drift_score por feature individual, para visibilidad granular
+        #     y poder identificar cuál feature genera el drift sin abrir el HTML.
+        r2, drift_share = None, None
+        column_drift_scores = {}
+        for m in report.as_dict().get('metrics', []):
+            metric_type = m.get('metric')
+            result = m.get('result', {})
+            if metric_type == 'RegressionQualityMetric':
+                r2 = result.get('current', {}).get('r2_score')
+            elif metric_type == 'DatasetDriftMetric':
+                drift_share = result.get('share_of_drifted_columns')
+            elif metric_type == 'DataDriftTable':
+                for col, info in result.get('drift_by_columns', {}).items():
+                    score = info.get('drift_score')
+                    if score is not None:
+                        column_drift_scores[col] = score
+
+        # Decay temporal: comparar R² actual contra el último production anterior a este DAG run
+        # MLFlow no guarda historia de aliases, así que aproximamos tomando la versión más reciente
+        # del modelo cuyo run_id NO pertenece al DAG actual. Es la versión que estaba en el Registry
+        # antes de que arrancara este DAG, candidata más razonable a "production anterior".
+        previous_r2 = None
+        all_versions = client.search_model_versions(f"name = '{model_name}'")
+        all_versions.sort(key = lambda v: int(v.creation_timestamp), reverse = True)
+        previous_versions = [v for v in all_versions if v.run_id not in current_run_ids]
+        if previous_versions:
+            previous_r2 = mlflow.get_run(previous_versions[0].run_id).data.metrics.get('r2')
+
+        delta_r2 = None
+        if r2 is not None and previous_r2 is not None:
+            delta_r2 = r2 - previous_r2
+
+        # Asociamos el reporte y métricas al run del modelo en producción para tener todo en un solo lugar
+        production_version = client.get_model_version_by_alias(model_name, "production")
+        with mlflow.start_run(run_id = production_version.run_id):
+            mlflow.log_artifact(report_path, artifact_path = 'monitoring')
+            if r2 is not None:
+                mlflow.log_metric('monitor_r2', r2)
+            if drift_share is not None:
+                mlflow.log_metric('monitor_drift_share', drift_share)
+            if delta_r2 is not None:
+                mlflow.log_metric('monitor_r2_delta', delta_r2)
+            # Drift score por feature: permite ver qué feature en particular tiene el drift
+            # más alto run-a-run sin abrir el HTML de Evidently.
+            for col, score in column_drift_scores.items():
+                mlflow.log_metric(f'monitor_drift_{col}', score)
+
+        # Alertas blandas: el DAG no aborta, solo deja warnings visibles en el log
+        msg_prefix = f"[MODEL_DECAY] {model_name}"
+        if r2 is not None and r2 < r2_floor:
+            log.warning(f"{msg_prefix} R² ({r2:.4f}) < floor ({r2_floor})")
+        if drift_share is not None and drift_share > drift_threshold:
+            log.warning(f"{msg_prefix} drift share ({drift_share:.0%}) > threshold ({drift_threshold:.0%})")
+        if delta_r2 is not None and delta_r2 < -r2_delta_threshold:
+            log.warning(f"{msg_prefix} R² delta ({delta_r2:+.4f}) < -{r2_delta_threshold} (decay vs. run anterior, R² previo = {previous_r2:.4f})")
+        elif previous_r2 is None:
+            log.info(f"{msg_prefix} sin run anterior para comparar decay (primera corrida del modelo)")
+        log.info(f"{msg_prefix} reporte: {report_path} (R²={r2}, drift_share={drift_share}, delta_r2={delta_r2})")
+
   # -------------------- SECUENCIAS --------------------
 
   FEATURE_STORE_REPO = '/opt/airflow/feature_store'
@@ -500,5 +668,9 @@ def ml_pipeline():
   # Pasamos los run_ids del DAG actual para que compare solo versiones de esta corrida
   best_model = select_best_model(eval_results)
   prev_task >> best_model
+
+  # Generamos el reporte de monitoreo del modelo en producción
+  monitor = monitor_model(eval_results = eval_results, splits = splits)
+  best_model >> monitor
 
 ml_pipeline()
