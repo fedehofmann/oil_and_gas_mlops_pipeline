@@ -1,0 +1,107 @@
+name: docs-check
+
+# Si un PR modifica código (DAG, API, feature store, infra) sin actualizar README ni
+# roadmap.md, dejamos un comentario en el PR como recordatorio. No bloquea el merge:
+# es una alerta blanda. Para PRs triviales (typos, cleanup) se puede saltar el check
+# agregando la label `skip-docs-check`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  check-docs:
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-docs-check') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detectar cambios en código vs. docs
+        id: changed
+        run: |
+          BASE_SHA=$(git merge-base origin/${{ github.base_ref }} HEAD)
+          ALL_CHANGED=$(git diff --name-only "$BASE_SHA" HEAD)
+
+          # Paths cuyo cambio sugiere documentación: lógica del pipeline, API,
+          # feature store, infra de containers o requirements.
+          CODE_CHANGED=$(echo "$ALL_CHANGED" | grep -E '^(dags/|api/|feature_store/|docker-compose\.yaml|\.env)' || true)
+          DOCS_CHANGED=$(echo "$ALL_CHANGED" | grep -E '^(README\.md|roadmap\.md)' || true)
+
+          {
+            echo "code_files<<EOF"
+            echo "$CODE_CHANGED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$CODE_CHANGED" ] && [ -z "$DOCS_CHANGED" ]; then
+            echo "needs_docs=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_docs=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comentar / actualizar comentario en el PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const needsDocs = `${{ steps.changed.outputs.needs_docs }}` === 'true';
+            const codeFiles = `${{ steps.changed.outputs.code_files }}`.trim();
+            const marker = '<!-- docs-check-bot -->';
+
+            const warningBody = `${marker}
+            ## ⚠️ Documentación pendiente
+
+            Este PR modifica código pero no actualiza \`README.md\` ni \`roadmap.md\`.
+
+            **Archivos de código tocados:**
+            \`\`\`
+            ${codeFiles}
+            \`\`\`
+
+            ¿Aplica alguno de estos casos?
+            - **Decisión de diseño nueva** → agregar al README, sección "Decisiones de diseño".
+            - **Feature en desarrollo / errores encontrados** → agregar entrada a la **bitácora** de \`roadmap.md\`.
+            - **Cambio de arquitectura** → ambos.
+            - **Cambio en el contrato de la API** → README, sección "API REST".
+            - **Cambio en deps / infra** → mencionar en el README de Setup si afecta a quien levanta el sistema.
+
+            Si el cambio es trivial (typo, cleanup, refactor sin impacto observable), agregá la label \`skip-docs-check\` al PR para saltar este chequeo.`;
+
+            const successBody = `${marker}
+            ## ✅ Documentación actualizada
+
+            Este PR ya incluye actualizaciones a \`README.md\` o \`roadmap.md\`. Gracias.`;
+
+            const body = needsDocs ? warningBody : successBody;
+
+            // Buscar comentario previo del bot para no duplicar
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const previous = comments.find(c => c.body && c.body.includes(marker));
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else if (needsDocs) {
+              // Solo creamos un comentario nuevo cuando hace falta el aviso.
+              // Si docs ya están bien y no había comentario, no ensuciamos el PR.
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
