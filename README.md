@@ -204,10 +204,18 @@ __pycache__/
 
 ```
 AIRFLOW_UID=501
-_PIP_ADDITIONAL_REQUIREMENTS=pandas scikit-learn mlflow feast fastapi uvicorn==0.40.0
+_PIP_ADDITIONAL_REQUIREMENTS=pandas scikit-learn mlflow feast fastapi uvicorn==0.40.0 evidently==0.6.7
+MODEL_QUALITY_R2_FLOOR=0.85
+MODEL_DECAY_DRIFT_SHARE_THRESHOLD=0.5
+MODEL_DECAY_R2_DELTA=0.05
 ```
 
-> **Nota:** `uvicorn==0.40.0` está pineado para evitar un conflicto de dependencias entre `feast` y `apache-airflow-core 3.1.7`. `feast==0.47.0` está pineado en el contenedor de la API para que coincida con la versión del worker de Airflow — versiones distintas de Feast son incompatibles en la serialización del online store.
+> **Notas sobre dependencias pineadas:**
+> - `uvicorn==0.40.0` evita un conflicto entre `feast` y `apache-airflow-core 3.1.7`.
+> - `feast==0.47.0` está pineado en el contenedor de la API para que coincida con la versión del worker de Airflow — versiones distintas son incompatibles en la serialización del online store.
+> - `evidently==0.6.7` mantiene la API clásica (`Report` + `metric_preset`) y soporta `scikit-learn>=1.6` (la 0.4.x rompe por uso interno de `mean_squared_error(squared=False)`).
+>
+> **Thresholds de model decay:** los tres valores anteriores son los defaults usados por la tarea `monitor_model`. Configurables sin tocar código. Ver detalle en [Decisiones de diseño](#decisiones-de-diseño).
 
 ### 4. Volúmenes en `docker-compose.yaml`
 
@@ -503,6 +511,89 @@ El default es overridable: dejar el campo vacío (null) al triggerear el DAG inc
 Esto es coherente con la semántica del filtro: si excluimos un año porque no es representativo del régimen operativo, no tiene sentido que la predicción futura del pozo apunte a un mes de ese año excluido. La fila futura se alinea con el último mes "válido" según el filtro, no con el último mes en bruto del CSV.
 
 **Consecuencia práctica al comparar runs con distintos `exclude_years`:** el conteo de filas por año no coincide exactamente incluso en años no filtrados, porque algunas filas futuras cambian de año entre runs. Es un artefacto esperado del orden filtro → fila futura, no un bug. En la validación de este PR, la diferencia de 1 fila entre runs en el año 2019 se explicó exactamente por este motivo (un pozo con data en 2020 cuya fila futura pasó de caer en julio 2020 a caer en enero 2020 al activar el filtro).
+
+### 12. Reporte de model decay y data drift con Evidently AI
+
+El RFC pide un reporte de model decay / data drift con al menos dos métricas que permitan observar cuándo la performance del modelo se aleja de la esperada. La tarea `monitor_model` (al final del DAG, después de `select_best_model`) lo cubre con tres señales independientes loggeadas en el run de MLFlow del modelo en producción.
+
+#### Por qué Evidently AI y no alibi-detect
+
+La librería de referencia vista en la práctica de la clase fue [alibi-detect](https://github.com/SeldonIO/alibi-detect), y de hecho fue la propuesta inicial del proyecto (issue #30, cerrado al consolidarse en #31). La diferencia clave entre las dos:
+
+| Aspecto | alibi-detect (visto en clase) | Evidently AI (elegido) |
+|---|---|---|
+| **Data drift** | Sí — algoritmos sofisticados (TabularDrift, MMD, KS, ChiSquare) | Sí — multi-test estadístico por feature, share of drifted columns |
+| **Model decay / regression performance** | **No** — está enfocado solo en drift y outlier detection | Sí — `RegressionPreset` con R², RMSE, MAE, error distribution |
+| **Reporte HTML out-of-the-box** | No (devuelve métricas crudas, hay que armar el reporte) | Sí — `report.save_html()` produce un dashboard navegable |
+| **Caso de uso principal** | Drift / outlier / adversarial detection en producción a escala | Reporting unificado de modelo + datos para entregables y MLFlow |
+
+El RFC pide específicamente **dos métricas: una de model decay y otra de data drift**. alibi-detect solo cubre la mitad (drift). Para el otro requisito habría que componer sklearn (regression metrics) + un templating engine (Jinja2) para el reporte HTML, sumando dos dependencias y código de glue. Evidently AI cubre ambas dimensiones con una sola librería, dos presets predefinidos y reportes HTML automáticos — por eso se eligió.
+
+#### Otras librerías evaluadas brevemente
+
+| Librería | Por qué se descartó |
+|---|---|
+| [NannyML](https://github.com/NannyML/nannyml) | Su fortaleza es estimar performance **sin ground truth** (CBPE — Confidence-Based Performance Estimation). El DAG sí produce ground truth en cada run (test set), así que esa fortaleza no aporta valor acá. |
+| [whylogs](https://github.com/whylabs/whylogs) | Excelente para profiling eficiente con integración cloud (WhyLabs SaaS), pero el caso de uso del proyecto es local en Docker y el reporte HTML requiere componer otras herramientas. |
+| Implementación propia (sklearn + PSI manual + Jinja2) | Costo de mantenimiento alto: hay que escribir y testear los cálculos estadísticos (KS-test, PSI por feature) y la generación del reporte. Para una entrega de TP el ratio costo/beneficio no se justifica frente a una librería que lo provee out-of-the-box. |
+
+**Versión pineada.** `evidently==0.6.7` — la API de las versiones 0.7.x es nueva e incompatible con la API clásica (`Report` + `metric_preset`). La 0.4.x (la primera elegida) resultó incompatible con `scikit-learn>=1.6` por uso interno de `mean_squared_error(squared=False)`, parámetro removido en sklearn 1.6+. Pinear 0.6.7 evita ambos extremos.
+
+**Stattest configurado para data drift.** La elección del stattest es crítica y pasó por dos iteraciones antes de quedar bien:
+
+1. **Default de Evidently (Wasserstein con threshold 0.5):** falsos negativos sistemáticos. Ninguna feature pasaba el threshold ni siquiera cuando había drift evidente por construcción (`n_readings`, que en train tiene mean ~5 y en test ~11). Threshold demasiado laxo para este dataset.
+2. **Kolmogorov-Smirnov / chi-square con p-value 0.05:** falsos positivos sistemáticos. Con miles de filas en train y test, los tests de hipótesis detectan diferencias **estadísticamente** significativas que no son **prácticamente** relevantes. 9/9 features quedaron marcadas como con drift.
+3. **PSI / Jensen-Shannon con threshold 0.1 (elegido):** miden la **magnitud del cambio**, no su significancia estadística. No escalan mal con el tamaño del sample.
+
+Configuración final:
+
+- **Numéricas:** Population Stability Index (`num_stattest='psi'`) con `num_stattest_threshold=0.1`. Threshold de la industria: PSI < 0.1 sin drift, 0.1-0.25 moderado, ≥ 0.25 severo. Coincide con la propuesta original del roadmap del proyecto.
+- **Categóricas:** Jensen-Shannon distance (`cat_stattest='jensenshannon'`) con `cat_stattest_threshold=0.1`. Análogo a PSI pero para variables categóricas; threshold consistente.
+
+**Lección general que dejó este proceso:** para data drift en producción de ML, **preferir métricas basadas en magnitud sobre tests de hipótesis**. Los p-values son útiles para tomar decisiones puntuales con muestras chicas; las métricas de magnitud son más robustas en pipelines automáticos donde el tamaño de muestra varía de un run a otro.
+
+Adicionalmente, además del agregado `monitor_drift_share`, `monitor_model` loguea **el drift_score de cada feature individual** como métrica en MLFlow (`monitor_drift_<feature>`). Esto permite identificar qué feature específica está generando el drift sin abrir el HTML.
+
+#### Comparación: reference vs. current
+
+Evidently se basa en comparar dos datasets. La elección concreta:
+
+| Dataset | Qué representa |
+|---|---|
+| **Reference** = train | Lo que el modelo aprendió |
+| **Current** = test | Datos más recientes que el modelo no vio durante fit |
+
+Esta comparación detecta dos cosas: (1) si la distribución de los features de test es distinta de la de train (data drift entre el régimen aprendido y el régimen reciente), y (2) si la performance del modelo en test es razonable (regression performance). No requiere persistir snapshots entre runs — el split temporal del DAG ya provee la asimetría temporal necesaria.
+
+#### Decay temporal entre runs
+
+Adicionalmente, `monitor_model` compara el R² del modelo recién promovido contra el del modelo que estaba en producción antes de este DAG run. MLFlow ya persiste todas las versiones del Model Registry, así que se puede leer la última versión cuyo `run_id` no pertenezca a este DAG (`current_run_ids` se obtiene de `eval_results`) y leer su métrica `r2`. La diferencia se loguea como `monitor_r2_delta`. En la primera corrida del modelo no hay versión anterior y el chequeo se saltea.
+
+#### Tres alertas blandas configurables vía `.env`
+
+| Variable | Default | Significado |
+|---|---|---|
+| `MODEL_QUALITY_R2_FLOOR` | `0.85` | Piso absoluto de R² del modelo en datos recientes (test). Si `R² < 0.85` el modelo no es publicable: alerta de calidad. |
+| `MODEL_DECAY_DRIFT_SHARE_THRESHOLD` | `0.5` | Porcentaje máximo aceptable de features con drift entre train y test. Si `drift_share > 0.5` la distribución cambió significativamente: alerta de data drift. |
+| `MODEL_DECAY_R2_DELTA` | `0.05` | Caída máxima aceptable de R² respecto al run anterior. Si `(R²_actual − R²_anterior) < −0.05` el modelo se degradó: alerta de decay temporal. |
+
+Las alertas son **blandas**: emiten `log.warning` en Airflow pero no abortan el DAG. La razón es que abortar dejaría el modelo viejo en producción de forma silenciosa — peor que tener un modelo nuevo con alerta visible para revisión humana. Los thresholds son configurables vía `.env` para ajustarse sin redeploy.
+
+#### Salida en MLFlow
+
+Por cada modelo en producción (`oil_gas_prod_gas`, `oil_gas_prod_pet`), `monitor_model` loguea en el run del modelo:
+
+- Artefacto `monitoring/monitor_<target>.html` — reporte completo de Evidently visualizable.
+- Métrica `monitor_r2` — R² en current.
+- Métrica `monitor_drift_share` — % de features con drift entre train y test.
+- Métrica `monitor_r2_delta` — delta de R² vs. el run anterior (si existe).
+
+Esto permite seguir la evolución del modelo a lo largo de los runs mensuales directamente desde la UI de MLFlow, sin tener que correlacionar runs manualmente.
+
+#### Lo que queda fuera (issues futuras)
+
+- **Snapshot del dataset del run anterior como `reference` de Evidently** (en lugar de train). Sería una comparación más fiel al concepto de drift en producción, pero requiere persistir el parquet de cada run.
+- **Score compuesto** (R² + RMSE + bias) en `select_best_model` para que la promoción a producción sea más robusta que solo R². El roadmap de la entrega lo describe; queda como issue separada.
 
 ---
 

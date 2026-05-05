@@ -1,25 +1,41 @@
 # Roadmap — Entrega Final (28/5)
 
-## Orden de desarrollo
+## Estado actual
 
-| Prioridad | Issue | Motivo |
-|---|---|---|
-| 1 | #6 Ray Serve | Obligatorio. Mayor riesgo técnico — va primero para tener margen de debuggear |
-| 2 | #7 Model decay report + #8 Threshold configurable | Obligatorios. Van en el mismo PR |
-| 3 | #18 Segundo dataset del RFC (metadata de pozos) | Quasi-obligatorio. Afecta el feature store — conviene integrarlo antes de que los quick wins reflejen el feature set definitivo |
-| 4 | #9 Evaluación desagregada + #10 Feature importance | Quick wins. Tocan la misma función (`evaluate_model`) — mismo PR |
-| 5 | #16 CI/CD | En este punto el código está estabilizado y los tests cubren algo real. Los PRs siguientes sirven como demostración del flujo completo |
-| 6 | #11 OpenAPI descriptions | Quick win. Solo en `main.py`, no toca el DAG |
-| 7 | #13 LabelEncoder como artefacto | Deuda técnica. Modifica `train_model` y la API |
-| 8 | #14 Validación de schema | Deuda técnica. Modifica `download_dataset` |
-| 9 | #15 Prediction logging | Deuda técnica. Solo en `main.py` |
-| 10 | #17 Point-in-Time | El más complejo arquitecturalmente. Solo si hay tiempo |
+| Estado | Feature | Fecha | Notas |
+|---|---|---|---|
+| ✅ Mergeado | #5 + metadata MLflow Model Registry | 2026-04-14 | Tags y descripción legible en Registry |
+| ✅ Mergeado | #19 `select_best_model` solo run actual | 2026-04-14 | Comparación determinística por DAG run |
+| ✅ Mergeado | #21 Decisiones de diseño en README | 2026-04-14 | 9 decisiones explícitas |
+| ✅ Mergeado | #22 Cleanup README + ajustes DAG | 2026-04-16 | Asimetría training-inference documentada |
+| ✅ Mergeado | #24 Cierre de #12 (CSV hash) | 2026-04-30 | Supuesto de inmutabilidad aceptado |
+| ✅ Mergeado | #29 Ray Serve (cubre #6 obligatorio) | 2026-04-30 | `num_replicas=2` unificado |
+| ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
+| 🔄 En curso | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-04-30 | Rama `feature/model-decay-monitor` |
+| ⏳ Pendiente | Incremental learning (#36) | - | Migrar RandomForest → XGBoost con training en chunks. Resuelve OOM en training y habilita entrenar con histórico completo. |
+| ⏳ Pendiente | #18 Segundo dataset del RFC | - | Información complementaria, no obligatorio |
+| ⏳ Pendiente | #9 + #10 Quick wins (eval desagregada + feature importance) | - | Mismo PR, toca `evaluate_model` |
+| ⏳ Pendiente | #16 CI/CD básico | - | GitHub Actions con tests + lint |
+| ⏳ Pendiente | #11 OpenAPI descriptions | - | Solo `main.py` |
+| ⏳ Pendiente | #13 LabelEncoder como artefacto | - | Persistir como pickle en MLFlow |
+| ⏳ Pendiente | #14 Validación de schema | - | `pandera` en `download_dataset` |
+| ⏳ Pendiente | #15 Prediction logging | - | CSV/SQLite en `main.py` |
+| ⏳ Pendiente | #17 Point-in-Time correct | - | Más complejo, solo si hay tiempo |
+
+**Notas sobre la evolución del scope:**
+
+- **#6 (Ray Serve):** ya implementado en [PR #29](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/pull/29). Era obligatorio del RFC (arquitectura escalable para inferencia).
+- **#7 + #8 + #30 consolidados en #31 (Evidently AI):** inicialmente se planteaban tres issues separados — reporte propio de model decay (#7), threshold configurable (#8) y drift detection con `alibi-detect` (#30). Al evaluar la implementación apareció Evidently AI, que cubre las tres cosas con una única librería (regression performance + data drift + tests asertivos con umbrales). Se cerró #30 y se consolidó todo el scope en #31, lo cual simplifica la arquitectura y reduce el mantenimiento.
+- **#23 (filtro COVID 2020):** cubierto en [PR #25](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/pull/25) con un mecanismo más general (`exclude_years` en lugar de hardcodear 2020).
 
 ---
 
 ## Requerimientos obligatorios pendientes
 
-Estos dos puntos son DEBE en la especificación del trabajo integrador y aún no están implementados.
+Tras releer el RFC, los obligatorios (DEBE) están todos en marcha o cerrados:
+
+- ✅ **Arquitectura escalable de inferencia (Ray):** cubierto por #29 (Ray Serve) — mergeado.
+- 🔄 **Reporte de model decay / data drift con al menos dos métricas:** en curso en #31 (Evidently AI).
 
 ---
 
@@ -208,3 +224,266 @@ Una línea por parámetro. El Swagger UI refleja los cambios automáticamente.
 **Problema:** El dataset de metadata de pozos (empresa operadora, formación geológica, cuenca, coordenadas) no está integrado. Esto tiene dos consecuencias: (1) incumplimiento parcial del RFC, y (2) el modelo no puede diferenciar pozos por sus características estructurales, lo que contribuye a la convergencia a la media documentada en inferencia futura.
 
 **Implementación:** En `download_dataset`, descargar también el segundo CSV (`energia_cbfa4d79-ffb3-4096-bab5-eb0dde9a8385`). En `prepare_offline_store`, hacer un join por `idpozo` para agregar columnas de metadata estática — candidatas: `formprod` (formación productiva), `cuenca`, `empresa`. Estas columnas pasan al feature store como features estáticos del pozo y quedan disponibles tanto en el offline store (entrenamiento) como en el online store (inferencia futura).
+
+---
+
+## Bitácora de implementación
+
+Registro cronológico por feature: errores encontrados, cómo se resolvieron y decisiones tomadas que no están explícitas en el código. El README documenta el **qué** (decisión final); esta bitácora documenta el **cómo** (proceso, errores, alternativas descartadas).
+
+---
+
+### Histórico — features ya mergeadas
+
+#### #5 + metadata MLflow Model Registry (mergeado 2026-04-14)
+
+Se documentó cada versión del Model Registry con tags (`run_name`, `n_estimators`, `max_depth`, `features`, `r2`) y descripción legible. **Decisión clave:** la descripción a nivel del modelo registrado se sobrescribe en cada run pero el contenido es estático — esto evita reescribir lógica de versionado pero genera una pequeña ineficiencia. Se aceptó porque la descripción del modelo es metadata del concepto, no del run.
+
+#### #19 — `select_best_model` filtra por run_id del DAG actual (mergeado 2026-04-14)
+
+**Problema detectado:** la versión original de `select_best_model` comparaba todas las versiones históricas del modelo en MLflow para decidir cuál promover. **Por qué fallaba:** dos runs entrenados con datasets distintos producen R² no comparables (un R² calculado sobre el test set de 2023 y otro sobre el test set de 2021 evalúan distribuciones distintas). **Decisión:** filtrar por `run_id` del DAG actual para que el resultado sea determinístico. Diferentes colaboradores corriendo el mismo DAG con los mismos datos llegan al mismo ganador.
+
+#### #21 — Decisiones de diseño documentadas en el README (mergeado 2026-04-14)
+
+Se agregaron 9 decisiones explícitas: split temporal en lugar de aleatorio, modelos independientes para gas y petróleo, alias `production` en lugar de stages deprecados, predicción autoregresiva descartada en la API, etc. **Por qué importa:** sin esta documentación, futuras modificaciones podrían revertir decisiones que ya se tomaron por buenas razones (ej. alguien que vea el split aleatorio "más simple" sin saber el data leakage que introduce).
+
+#### #22 — Cleanup del README + asimetría training-inference (mergeado 2026-04-16)
+
+**Decisión clave documentada:** el modelo se entrena con features de mes T para predecir target de mes T (T→T), pero en inferencia se usan features del último mes conocido para predecir el mes siguiente (T→T+1). Esto significa que el modelo **nunca aprendió explícitamente la relación T→T+1** — asume que el estado del mes más reciente es un proxy razonable para el siguiente. Es una limitación conocida del pipeline, registrada como pendiente para futuras iteraciones.
+
+#### #24 — Cierre de #12 (CSV hash) (mergeado 2026-04-30)
+
+**Decisión:** **no implementar** hashing del CSV descargado. El supuesto es que los datos históricos del Ministerio de Energía son inmutables una vez publicados (aceptado por el docente). Si el supuesto se viola en producción a escala, el plan documentado es agregar `mlflow.log_param("dataset_hash", md5)` en `download_dataset`. **Por qué se cerró sin implementar:** agregar hashing introduce complejidad sin valor mientras el supuesto se mantenga. Decisión costo/beneficio.
+
+#### #29 — Ray Serve para inferencia escalable (mergeado 2026-04-30)
+
+Cubre el obligatorio del RFC sobre arquitectura escalable. **Decisión clave:** deployment unificado con `num_replicas=2` (gas + pet en el mismo deployment) en lugar de deployments separados. **Razonamiento:** balancear memoria (320 MB total con 2 réplicas) contra fault tolerance (si una réplica muere, la otra atiende mientras Ray la recrea). Tres issues abiertas para optimizaciones data-driven: #26 (separación gas/pet si la carga lo justifica), #27 (cache Redis), #28 (autoscaling).
+
+#### #25 — Exclusión automática de años atípicos (mergeado 2026-04-30)
+
+Reemplaza el filtro manual por un param `exclude_years=[2020]` por default. **Decisión clave:** filtrar 2020 específicamente, no `date_from=2021-01-01`. **Razón:** descartar datos pre-COVID válidos sería arbitrario; lo que queremos excluir es el régimen anómalo, no un cutoff temporal. **Efecto colateral documentado:** la fila futura del online store puede desplazarse a un año anterior al excluido (un pozo con data hasta junio 2020 termina con fila futura en enero 2020 cuando se filtra 2020). Es coherente con la semántica del filtro.
+
+---
+
+### En desarrollo — #31 Reporte de model decay con Evidently AI
+
+**Rama:** `feature/model-decay-monitor`
+**Inicio:** 2026-04-30
+**Estado:** En desarrollo, validación en curso del DAG end-to-end.
+**Cubre obligatorio del RFC:** "El sistema DEBE dar un reporte de model decay / data drift con al menos dos métricas que permitan observar cuándo la performance del modelo se aleja de la esperada."
+**Consolida issues:** #7 (model decay report), #8 (threshold configurable), motivación de #30 (alibi-detect, cerrado).
+
+#### Decisiones tomadas durante la implementación
+
+1. **Reference = train, Current = test** (en lugar de snapshots persistentes entre runs).
+   - **Por qué:** la asimetría temporal del split del DAG (test = datos más recientes) ya provee la base para detectar drift sin requerir persistir parquets entre runs.
+   - **Trade-off aceptado:** no es decay "puro" entre runs, sino una mezcla de drift train→test + calidad del modelo en datos no vistos.
+   - **Mitigado con:** decay temporal explícito (siguiente decisión).
+
+2. **Sumar decay temporal real (delta R² entre runs).**
+   - **Evolución del razonamiento:** la primera versión del monitor tenía solo un threshold absoluto sobre R² (`R² < 0.85` → alerta de calidad). Al revisar el alcance, se identificó que ese threshold detecta "modelo malo" pero no "modelo que se degradó" — y el RFC pide específicamente *decay*, que es un concepto temporal: comparar performance actual contra performance esperada/anterior.
+   - **Decisión:** agregar comparación `r2_actual - r2_anterior` leyendo del Model Registry, que ya persiste todas las versiones. No requiere persistencia adicional.
+   - **Cómo identificar la versión "anterior":** filtrar versiones cuyo `run_id` no esté en `current_run_ids` (los del DAG actual) y tomar la más reciente.
+
+3. **Tres thresholds independientes vía `.env`:**
+   - `MODEL_QUALITY_R2_FLOOR=0.85` — piso absoluto de calidad sobre R² del modelo en test.
+   - `MODEL_DECAY_DRIFT_SHARE_THRESHOLD=0.5` — % máximo aceptable de features con drift.
+   - `MODEL_DECAY_R2_DELTA=0.05` — caída máxima aceptable de R² entre runs.
+   - **Por qué tres y no uno:** cada uno cubre una pregunta distinta (calidad / drift de datos / decay temporal). Tener uno solo dejaría agujeros.
+
+4. **Alertas blandas (warnings en log de Airflow, no abortan el DAG).**
+   - **Por qué:** abortar dejaría el modelo viejo en producción de forma silenciosa. Peor que un nuevo modelo con alerta visible que un humano puede revisar.
+
+5. **Evidently AI sobre alibi-detect (la librería vista en clase).**
+   - **Por qué se descartó alibi-detect:** cubre solo drift, no regression performance ni reportes HTML. El RFC pide ambas dimensiones. Evidently los provee con dos presets predefinidos en una sola dependencia.
+   - **Otras alternativas evaluadas:** NannyML (caso de uso distinto: estimación sin ground truth, no aplica acá), whylogs (orientado a profiling con cloud SaaS, fuera del scope local), implementación propia con sklearn + Jinja2 (mantenimiento alto).
+
+6. **`evidently==0.6.7` pineado** (en lugar de 0.4.40 inicial o 0.7.x).
+   - **Por qué se reemplazó 0.4.40:** rompió en runtime con `TypeError: got an unexpected keyword argument 'squared'` por incompatibilidad con sklearn 1.8 (ver error 3 abajo).
+   - **Por qué 0.6.7 sobre 0.7.x:** la API de 0.7+ es nueva y rompe `Report` + `metric_preset`. La 0.6.x mantiene la API clásica más estable.
+
+#### Errores encontrados y resoluciones
+
+##### Error 1 — OOM en `download_dataset` (run 21:02:43, 21:08:35)
+
+**Síntoma:**
+```
+critical: Process terminated by signal. Likely out of memory error (OOM).
+signal=-9 (SIGKILL)
+```
+
+**Causa raíz:** la tarea hacía `pd.read_csv(url)` para descargar y `df.to_csv(save_path)` para guardar. El CSV completo del MINEM se cargaba en memoria como DataFrame (~200 MB con tipos inferidos) antes de escribirse. La tarea funcionaba con la huella de memoria anterior, pero al sumar Evidently a `_PIP_ADDITIONAL_REQUIREMENTS` se trajeron deps pesadas (matplotlib, plotly, dask, statsmodels, mlflow 3.11) que aumentaron la huella permanente del worker container, dejando menos margen para cargas puntuales.
+
+**Solución:** descargar con streaming directo a disco usando `urllib.request.urlopen` + `shutil.copyfileobj`, sin pasar por pandas. Reduce el uso de memoria de la tarea de ~200 MB a casi cero.
+
+```python
+with urllib.request.urlopen(url) as response, open(save_path, 'wb') as out_file:
+    shutil.copyfileobj(response, out_file)
+```
+
+##### Error 2 — OOM en `prepare_offline_store` (run 21:08:35)
+
+**Síntoma:** mismo SIGKILL, ahora 1 segundo después de arrancar la tarea — síntoma de OOM al inicio del proceso, no durante el procesamiento.
+
+**Causa raíz:** estructural. `docker stats` mostró que los 9 containers totalizan ~7.13 GB de los 7.65 GB asignados a Docker Desktop (93% de uso). El container `api-1` con Ray Serve a 2 réplicas consume 2.34 GB (el más grande de todos). Cuando `prepare_offline_store` arranca y necesita cargar el CSV + procesarlo en memoria, no entra.
+
+**Solución (workaround):** parar `api-1` durante el DAG run. La API de inferencia no se necesita para entrenar. Libera 2.3 GB.
+
+```bash
+docker compose stop api
+# trigger DAG
+docker compose start api  # cuando termine
+```
+
+**Soluciones permanentes (no aplicadas, registradas como issues futuras):**
+- Subir RAM de Docker Desktop a 10-12 GB (depende del entorno local de cada usuario).
+- Bajar `num_replicas=2 → 1` en Ray Serve (cambia decisión #10 del README, requiere PR aparte).
+
+##### Error 3 — `TypeError: got an unexpected keyword argument 'squared'` (run 21:13:42)
+
+**Síntoma:**
+```
+File ".../evidently/metrics/regression_performance/regression_quality.py:119"
+TypeError: got an unexpected keyword argument 'squared'
+```
+
+**Causa raíz:** incompatibilidad entre `evidently==0.4.40` y `scikit-learn==1.8.0` (la versión que arrastró mlflow 3.11). Evidently 0.4.x llamaba internamente `mean_squared_error(y_true, y_pred, squared=False)` para calcular RMSE. El parámetro `squared` fue **removido en sklearn 1.6+**; la nueva forma es `root_mean_squared_error()`.
+
+**Solución:** actualizar a `evidently==0.6.7`, que ya no usa `squared=False` y mantiene la API clásica (`Report` + `metric_preset`). La 0.7+ se descartó porque cambió la API por completo y aún está en evolución.
+
+**Cambio en `.env`:**
+```diff
+- evidently==0.4.40
++ evidently==0.6.7
+```
+
+##### Error 4 — `drift_share=0.0` en ambos targets (falso negativo del default de Evidently)
+
+**Síntoma:** la primera corrida exitosa de `monitor_model` (run 21:39:44) reportó:
+```
+[MODEL_DECAY] oil_gas_prod_gas R²=0.872, drift_share=0.0
+[MODEL_DECAY] oil_gas_prod_pet R²=0.910, drift_share=0.0
+```
+
+`drift_share=0.0` significa "ninguna feature con drift". Sospechoso — `n_readings` tiene drift por construcción (en train acumula menos lecturas que en test).
+
+**Causa raíz:** Evidently usa por default **Wasserstein distance con threshold 0.5** para features numéricas. Inspeccionando el HTML del reporte, los drift_scores reales eran:
+
+| Feature | Wasserstein score |
+|---|---|
+| tef | 0.085 |
+| n_readings | 0.053 |
+| target | 0.046 |
+| prediction | 0.033 |
+| prod_agua | 0.027 |
+| avg_prod_gas_10m | 0.019 |
+| last_prod_gas | 0.018 |
+| tipoextraccion | 0.016 |
+| profundidad | 0.015 |
+
+Todos están **muy por debajo de 0.5**. Por lo tanto: 0/9 features con drift detectado → `share_of_drifted_columns = 0`. El parsing del dict estaba bien; el threshold default era el problema. Para el dominio del proyecto, scores entre 0.05 y 0.10 ya son señales relevantes que el default oculta.
+
+**Solución (primera iteración, falló):** cambiar el stattest default por tests de hipótesis con threshold interpretable:
+- `num_stattest='ks'` (Kolmogorov-Smirnov) con `num_stattest_threshold=0.05` (p-value).
+- `cat_stattest='chisquare'` con `cat_stattest_threshold=0.05`.
+
+Adicionalmente se agregó al monitor el logueo de `monitor_drift_<feature>` por cada feature individual en MLFlow, para tener visibilidad granular sin abrir el HTML del reporte.
+
+##### Error 5 — `drift_share=1.0` en ambos targets (falso positivo de KS con muestra grande)
+
+**Síntoma:** la corrida con KS + chi-square (run 23:50:48) reportó:
+```
+[MODEL_DECAY] oil_gas_prod_gas drift share (100%) > threshold (50%)
+[MODEL_DECAY] oil_gas_prod_pet drift share (100%) > threshold (50%)
+```
+
+9/9 features marcadas como con drift. Saltó del extremo opuesto al original.
+
+**Causa raíz:** **tests de hipótesis (KS, chi-square) son ultra-sensibles al tamaño de muestra.** Con miles de filas en train y test, el p-value se hace minúsculo aunque la diferencia entre distribuciones sea minúscula. Inspeccionando el HTML, los p-values reales fueron:
+
+| Feature | Stattest | p-value |
+|---|---|---|
+| target | KS | 1.2e-05 |
+| prediction | KS | 1e-06 |
+| tef | KS | 0.0 |
+| n_readings | KS | 0.0 |
+| profundidad | KS | 0.0 |
+| last_prod_gas | KS | 0.000325 |
+| tipoextraccion | chi-square | 0.000723 |
+| avg_prod_gas_10m | KS | 0.0325 |
+| prod_agua | KS | 0.0397 |
+
+Todos por debajo de 0.05 → 9/9 con drift. Las features con p-value 0.0 (tef, n_readings, profundidad) sí tienen cambios reales, pero los otros (avg_prod_gas_10m con p=0.03) están en el filo y probablemente sean diferencias mínimas detectadas como significantes solo por el N grande.
+
+**Solución (definitiva):** cambiar a métricas que miden **magnitud del cambio**, no significancia estadística:
+- `num_stattest='psi'` (Population Stability Index) con `num_stattest_threshold=0.1`.
+- `cat_stattest='jensenshannon'` (Jensen-Shannon distance) con `cat_stattest_threshold=0.1`.
+
+PSI es el threshold estándar de la industria (PSI < 0.1 sin drift, 0.1-0.25 moderado, ≥ 0.25 severo) y **no depende del tamaño de muestra**. Coincide además con la propuesta original del item 1 del roadmap del proyecto.
+
+**Lección general:** para data drift en pipelines automáticos donde el tamaño de muestra varía de un run a otro, **preferir métricas de magnitud sobre tests de hipótesis**. Los p-values son útiles para decisiones puntuales con muestras chicas; las métricas de magnitud son más robustas en producción.
+
+#### Próximos pasos para cerrar #31
+
+1. Validar la corrida end-to-end después del fix de Evidently 0.6.7.
+2. Verificar artefactos: HTML del reporte en MLFlow + métricas `monitor_r2`, `monitor_drift_share`, `monitor_r2_delta`.
+3. Commitear y abrir PR con CODEOWNERS auto-asignando review.
+4. Reiniciar `api-1` después del DAG para volver al setup completo.
+
+---
+
+### Próximos features e issues a abrir
+
+#### Issues abiertas a tomar en orden
+
+1. **Incremental learning con memoria acotada — migrar RandomForest → XGBoost ([#36](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/36)).**
+
+    **Problema actual:** `RandomForestRegressor.fit()` carga el dataset completo en RAM. Esto limita el rango de fechas con el que se puede entrenar localmente a aproximadamente 1 año. Para histórico completo (~2019 en adelante) rompe por OOM. La limitación es **estructural al algoritmo**, no de implementación: Random Forest es un *bagging ensemble* donde cada árbol se entrena sobre un bootstrap sample del dataset completo, por lo que necesita acceso simultáneo a toda la data al armar cada árbol. No tiene `partial_fit` y no puede tenerlo.
+
+    **Por qué el cambio resuelve el OOM:** XGBoost es un *gradient boosting ensemble* construido secuencialmente. Cada árbol nuevo aprende del **error residual** del modelo anterior, no del dataset original. Esa propiedad permite agregar árboles al final de un modelo previo entrenando solo con un chunk nuevo de datos: el batch actual + el modelo previo (chico) son todo lo que necesita en RAM en cada paso.
+
+    **Cuenta de memoria:**
+
+    | Esquema | Memoria peak | Limitante |
+    |---|---|---|
+    | RF + dataset completo (actual) | `sizeof(dataset) + sizeof(modelo) ≈ 5 GB + 50 MB` | Si el dataset > RAM → OOM, sin escape posible. |
+    | XGBoost incremental por chunks | `sizeof(chunk) + sizeof(modelo_creciente) ≈ 500 MB + ~10 MB` | Acotada por `chunk_size`, independiente del dataset total. |
+
+    **Aclaración importante:** la mejora de memoria viene de **dos cambios juntos**, no del modelo solo. Cambiar a XGBoost sin iterar el dataset (`xgb.fit(dataset_completo)`) reproduciría la misma OOM. Lo que reduce memoria es la combinación de:
+
+    1. Un algoritmo que soporta continuación de entrenamiento (XGBoost via `xgb_model` parameter, o SGDRegressor via `partial_fit`).
+    2. Un loop de entrenamiento que itera el dataset por batches en lugar de pasarlo entero.
+
+    **Por qué XGBoost sobre SGDRegressor:** SGDRegressor también soporta `partial_fit` y mantiene memoria estrictamente constante. Pero es un modelo lineal — pierde la capacidad de capturar relaciones no-lineales entre features (rolling means, profundidad, tipoextraccion). El proyecto perdería capacidad predictiva. XGBoost preserva la capacidad no-lineal de los árboles y eso es más valioso que la diferencia marginal de memoria entre los dos esquemas (en ambos casos la memoria queda acotada por chunk).
+
+    **Trade-offs aceptados:**
+    - El modelo crece linealmente con la cantidad de chunks (cada chunk agrega árboles), pero el crecimiento está acotado: con `max_depth=6` y 100 árboles totales el booster pesa < 10 MB.
+    - Hiperparámetros distintos. `n_estimators` en XGBoost incremental significa "árboles a agregar por chunk", no el total — pitfall a tener mapeado.
+    - La API de inferencia (`api/main.py`) tiene que migrar de `mlflow.sklearn.load_model` a `mlflow.xgboost.load_model`.
+
+    **Lo que NO resuelve este issue:**
+    - El OOM de `prepare_offline_store` (carga del CSV completo + groupby + rolling). Eso es un cuello de botella separado, antes del training. Issue futura: refactorear ese task a procesamiento por chunks o usar Dask/Polars.
+    - El OOM de presión total de containers (Ray Serve + entrenamientos + Evidently). Ese se resuelve con más RAM en Docker Desktop o bajando `num_replicas` de Ray Serve.
+
+    **Decisiones técnicas tomadas en la planificación** (todas en el issue #36):
+    - Versión: `xgboost==3.2.0`, sklearn-style API (`XGBRegressor.fit(X, y, xgb_model=prev_path)`).
+    - Logueo en MLFlow: `mlflow.xgboost.log_model(model_format="ubj")` — formato nativo, no pickle (más portable, preserva metadata categórica).
+    - `learning_rate = 0.1` (default 0.3 es agresivo para incremental).
+    - Chunks **mensuales** y orden **temporal** (no shuffle): coherente con el split temporal del DAG y con el caso de uso de inferencia (predecir mes siguiente, los meses recientes pesan más).
+    - **Mantener `LabelEncoder`** para `tipoextraccion` por ahora; migrar a `enable_categorical=True` queda para un PR aparte.
+    - **Issue #13 (LabelEncoder como artefacto)** queda separado: ya tiene su propio scope.
+2. **#18 Segundo dataset del RFC** (información complementaria, no obligatorio).
+3. **#9 + #10** Quick wins de evaluación desagregada y feature importance (mismo PR, toca `evaluate_model`).
+4. **#16 CI/CD básico** con GitHub Actions: tests + lint + validación de schema de `features.py`.
+5. **#11 OpenAPI descriptions** en `main.py` (Swagger más usable).
+6. **#13 LabelEncoder como artefacto** (cierra training-serving skew latente).
+7. **#14 Validación de schema** del CSV con pandera.
+8. **#15 Prediction logging** en la API.
+9. **#17 Point-in-Time correct** vía `entity_df` con `event_timestamp` en Feast.
+
+#### Issues nuevas detectadas durante #31
+
+- **Snapshot del run anterior como `reference` de Evidently** (en lugar de train). Sería decay "puro" pero requiere persistir el parquet de cada run en el repo de Feast o en S3-equivalente.
+- **Score compuesto en `select_best_model`** (R² + RMSE + bias). Más robusto que solo R² para promoción a producción. El roadmap del proyecto lo describe en el ítem 1; queda como issue separada.
+- **Evaluar bajar `num_replicas=2 → 1` en Ray Serve** o subir RAM de Docker Desktop. El estado actual obliga a parar `api-1` para correr el DAG, lo cual es operativamente inviable en producción.
+- **Cleanup automático de versiones viejas en MLFlow.** El Model Registry acumula todas las versiones entrenadas; con runs mensuales esto crece linealmente. Una política de retención (ej. mantener las últimas 10 + la actual production) evitaría que la búsqueda de "versión anterior" en `monitor_model` se vuelva lenta.
