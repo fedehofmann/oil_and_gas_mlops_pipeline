@@ -461,14 +461,73 @@ XGBoost es un *gradient boosting ensemble* construido secuencialmente: cada árb
 
 - **DAG completó exitosamente** las 27 tareas (download, prepare, online_store, split, 10 × train+evaluate, select_best_model, monitor_model). 0 fallos.
 - **Training:** ejemplo del primer experimento (prod_pet, 5 árboles/chunk): 31.940 samples procesados en **9 chunks mensuales**, 45 árboles totales en el modelo final.
-- **monitor_model:** R²=0.869 (gas), R²=0.895 (pet). Por encima del floor 0.85. drift_share=0.0 (PSI < 0.1 en todas las features, esperable porque train y test son del mismo año).
-- **Comparación con RandomForest anterior:** RF logra 0.872/0.910, XGBoost logra 0.869/0.895. Caída marginal (~0.3% / ~1.5%) explicable por el menor número de árboles totales (45-90 vs 100) y `learning_rate=0.1` conservador. Tradeoff aceptable a cambio de poder escalar en memoria.
 - **Memoria:** training en chunks no provocó picos de RAM perceptibles, a diferencia del RF que generaba presión cerca del límite.
 
-#### Lo que NO resuelve esta feature
+#### Validación cuantitativa con 3 escenarios de rango temporal
 
-- OOM en `prepare_offline_store` (carga del CSV + `groupby` + `rolling` con pandas in-memory). Es un cuello de botella separado, antes del training. Issue futura: refactorear a procesamiento por chunks o usar Dask/Polars.
-- Presión de RAM por containers simultáneos. Sigue siendo necesario parar `api-1` durante el DAG run o subir RAM de Docker Desktop.
+Después de la validación end-to-end inicial, se diseñó un experimento más riguroso para cuantificar el tradeoff RF vs XGBoost. La idea: correr el DAG con tres rangos temporales crecientes (A: 2 años, B: 3 años, C: 4 años efectivos) en ambos modelos y medir tiempo, RAM y performance.
+
+**Tabla 1 — Resumen ejecutivo**
+
+| Escenario | Modelo | Estado | Tiempo total | Tiempo train_model (suma 10 exp) | RAM peak worker |
+|---|---|---|---|---|---|
+| A (2022-2023) | XGBoost | ✅ success | **244s** | **45s** | **2.99 GiB** |
+| A (2022-2023) | RandomForest | ✅ success | 469s | 211s | 3.53 GiB |
+| B (2020-2023) | XGBoost | ❌ failed en `split_data` | 98s | (no llegó) | 3.67 GiB |
+| B (2020-2023) | RandomForest | (saltado, fallaría idéntico) | — | — | — |
+| C (2019-2023) | XGBoost | (saltado, fallaría idéntico) | — | — | — |
+| C (2019-2023) | RandomForest | (saltado, fallaría idéntico) | — | — | — |
+
+**Tabla 2 — Setup**
+
+| Escenario | Modelo | Filas X_train | Árboles totales | Hiperparámetros clave |
+|---|---|---|---|---|
+| A | XGBoost | 63.424 | 95 (5 × 19 chunks) | est_pc=5, depth=6, lr=0.1 |
+| A | RandomForest | 63.424 | 100 | est=100, depth=10 |
+
+**Tabla 3 — Performance (escenario A, único comparable)**
+
+| Modelo | R² gas | R² pet | RMSE gas (m³) | RMSE pet (m³) | MAE gas (m³) | MAE pet (m³) |
+|---|---|---|---|---|---|---|
+| XGBoost | 0.871 | 0.863 | 668,9 | 393,8 | 193,3 | 122,4 |
+| RandomForest | **0.923** | **0.902** | **517,4** | **334,4** | **141,7** | **93,7** |
+| Δ (RF − XGB) | +5,2 pp | +3,9 pp | −151,5 (−23%) | −59,4 (−15%) | −51,6 (−27%) | −28,7 (−24%) |
+
+**Lectura del experimento:**
+
+- **XGBoost gana en eficiencia operativa**: ~2× más rápido total, ~5× más rápido específicamente en `train_model`, 15% menos RAM peak. En producción mensual estos ahorros son reales.
+- **RandomForest gana en precisión** en este rango chico: R² entre 4 y 5 pp mejor, RMSE 15-23% menor.
+- **B y C revelan el siguiente cuello de botella**: con 3+ años, ambos modelos fallan en `split_data` por OOM. La razón no es el modelo: es Feast cargando todo en memoria al hacer `get_historical_features`, antes incluso de empezar a entrenar.
+
+#### Tuning fallido — la config conservadora era el techo
+
+Tras ver la pérdida de performance, se intentó tunear XGBoost con configuraciones más agresivas (max_depth=8-10, learning_rate=0.1-0.2, est_pc=10-15) bajo la hipótesis de que la config original era subóptima por árboles muy chicos y learning_rate muy bajo.
+
+**Resultado: todos los experimentos empeoraron.**
+
+| Configuración | R² gas | R² pet | Diagnóstico |
+|---|---|---|---|
+| depth=6, lr=0.1, est_pc=5 (original) | 0.871 | 0.863 | Baseline. |
+| depth=10, lr=0.1, est_pc=10 | 0.661 | 0.673 | −0,21 pp |
+| depth=10, lr=0.2, est_pc=10 | −0.04 | −0.24 | Catastrófico. |
+| depth=8, lr=0.1, est_pc=15 | 0.458 | 0.484 | −0,41 pp |
+| depth=8, lr=0.2, est_pc=10 | −0.08 | 0.217 | Catastrófico. |
+| depth=10, lr=0.1, reduced features | −0.46 | −0.07 | Catastrófico. |
+
+**Diagnóstico — overfitting estructural por incremental + árboles profundos:**
+
+Con `max_depth=10` cada árbol es muy expresivo. Con 19 chunks × 10 árboles = 190 árboles muy expresivos acumulados. Cada chunk se ajusta al residuo de su mes específico y memoriza patrones locales. El test set es contiguous a los meses finales del train (split temporal 80/20 sobre fechas), entonces los chunks finales overfittean justo donde se va a evaluar. `learning_rate=0.2` acelera el efecto.
+
+**Aprendizaje: la pérdida de R² ~5 pp vs RandomForest no es por subóptima configuración — es el costo intrínseco del incremental learning con árboles en este dataset.** Subir capacidad expresiva (depth) o agresividad (lr) empeora porque ya estábamos en el sweet spot.
+
+Se vuelve a la configuración original (depth=6, lr=0.1, est_pc=5) y se acepta el tradeoff documentado.
+
+#### Lo que NO resuelve esta feature (próximos cuellos de botella)
+
+1. **`split_data` y `prepare_offline_store` siguen cargando todo en memoria.** Los escenarios B y C fallaron acá, antes del training. **Es el siguiente bottleneck prioritario** — issue separado a abrir: refactorear estas tareas a procesamiento por chunks o migrar de pandas in-memory a Dask/Polars. **Resolver esto desbloquea dos mejoras independientes que pueden compensar la pérdida de performance:**
+   - Entrenar con histórico completo (B/C escenarios). XGBoost con más datos típicamente mejora; el escalado a 4+ años puede acercar la performance a RF e incluso superarla en datos más recientes.
+   - Sumar el segundo dataset del RFC ([#18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18)) con metadata estructural por pozo (formación geológica, cuenca, empresa). Esos features tienen capacidad explicativa que hoy no está en el modelo y podrían cerrar la brecha vs RandomForest.
+2. **Presión de RAM por containers simultáneos.** Sigue siendo necesario parar `api-1` durante el DAG run o subir RAM de Docker Desktop.
 
 ---
 

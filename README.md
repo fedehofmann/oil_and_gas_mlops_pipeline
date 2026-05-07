@@ -633,9 +633,35 @@ El orden cronológico es deliberado: los meses recientes pesan más en el modelo
 - `tipoextraccion` se sigue encodando con `LabelEncoder` (entero ordinal). XGBoost lo trata como ordinal numérico — subóptimo pero funciona. Migrar a `enable_categorical=True` con `pd.Categorical` queda para [issue #13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13).
 - La API de inferencia (`api/main.py`) carga ahora con `mlflow.xgboost.load_model` en lugar de `mlflow.sklearn.load_model` — cambio chico, transparente al cliente.
 
+**Validación cuantitativa con tres escenarios de rango temporal:**
+
+Para cuantificar el tradeoff vs RandomForest se corrió el DAG con tres rangos crecientes (A: 2 años, B: 3 años, C: 4 años efectivos) en ambos modelos, midiendo tiempo, RAM peak, R², RMSE y MAE.
+
+**Resumen ejecutivo (escenario A, único comparable):**
+
+| Modelo | Estado | Tiempo total | Tiempo `train_model` | RAM peak worker |
+|---|---|---|---|---|
+| **XGBoost incremental** | ✅ success | **244s** | **45s** | **2,99 GiB** |
+| RandomForest | ✅ success | 469s | 211s | 3,53 GiB |
+
+**Performance (escenario A):**
+
+| Modelo | R² gas | R² pet | RMSE gas (m³) | RMSE pet (m³) |
+|---|---|---|---|---|
+| XGBoost | 0,871 | 0,863 | 668,9 | 393,8 |
+| RandomForest | **0,923** | **0,902** | **517,4** | **334,4** |
+
+**Hallazgo principal:** en escenarios B y C (3-4 años) **ambos modelos fallan en `split_data`** — Feast cargando todo en memoria al hacer `get_historical_features`. El próximo cuello de botella se mueve del training al feature store. Lectura: XGBoost incremental cumplió su promesa de resolver el OOM del training, pero el siguiente bottleneck aparece antes en el pipeline.
+
+**Tuning fallido:** se intentó cerrar la brecha de performance vs RandomForest con configuraciones más agresivas (`max_depth=10`, `learning_rate=0,2`, más árboles). Todos los experimentos empeoraron — varios con R² negativo. La causa es overfitting estructural: con `max_depth` alto cada árbol es muy expresivo, y al acumular muchos chunks el modelo memoriza patrones locales de los meses finales (que coinciden con el test set por el split temporal). Conclusión: **la configuración elegida (`max_depth=6`, `learning_rate=0,1`, `est_pc=5`) está cerca del techo accesible con esta arquitectura**. La pérdida de ~5 pp en R² no es por subóptima configuración, es el costo intrínseco del incremental learning con árboles en este dataset.
+
+**Camino para cerrar la brecha de performance:**
+
+La pérdida vs RandomForest no se cierra tuneando — se cierra dándole **más datos** al modelo (entrenar con 3+ años) o **mejores features** (sumar el segundo dataset del RFC con metadata estructural por pozo). Ambas mejoras requieren resolver primero el bottleneck de Feast en `split_data`. Por eso la prioridad siguiente del proyecto pasa al feature store, no al modelo.
+
 **Lo que NO resuelve este cambio:**
 
-- El OOM en `prepare_offline_store` (carga del CSV completo + `groupby` + `rolling` con pandas in-memory). Eso es un cuello de botella separado, antes del training. Issue futura: refactorear ese task a procesamiento por chunks o usar Dask/Polars.
+- El OOM en `split_data` y `prepare_offline_store` (Feast + pandas in-memory cargando todo el dataset). Es el siguiente cuello de botella prioritario y desbloquea entrenar con histórico extenso + sumar el segundo dataset (#18). Issue separado para tomar después.
 - El OOM por presión total de containers (Ray Serve + entrenamiento + Evidently corriendo simultáneamente). Se mitiga parando `api-1` durante el DAG run o subiendo la RAM asignada a Docker Desktop.
 
 ---

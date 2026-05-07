@@ -18,6 +18,12 @@ EXPERIMENTS = [
     # Total de árboles del modelo final = n_estimators_per_chunk * cantidad de meses en train.
     # Ej: con dataset de ~10 meses de train, n_estimators_per_chunk=10 → ~100 árboles totales.
     # learning_rate=0.1 (más conservador que el default 0.3, ningún chunk individual domina).
+    #
+    # Grilla validada experimentalmente: configuraciones más agresivas (max_depth=10,
+    # learning_rate=0.2) generan overfitting estructural por la combinación incremental
+    # + árboles profundos (cada chunk se ajusta al residuo local y memoriza patrones del
+    # mes; con muchos chunks se sobreajusta justo a los meses contiguos al test set).
+    # Detalle en la bitácora: "Tuning fallido — la config conservadora era el techo".
 
     # prod_pet: variando n_estimators_per_chunk
     {'target': 'prod_pet', 'model_params': {'n_estimators_per_chunk': 5,  'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_PET},
