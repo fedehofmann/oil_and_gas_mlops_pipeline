@@ -12,7 +12,7 @@
 | ✅ Mergeado | #29 Ray Serve (cubre #6 obligatorio) | 2026-04-30 | `num_replicas=2` unificado |
 | ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
 | 🔄 En curso | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-04-30 | Rama `feature/model-decay-monitor` |
-| ⏳ Pendiente | Incremental learning (#36) | - | Migrar RandomForest → XGBoost con training en chunks. Resuelve OOM en training y habilita entrenar con histórico completo. |
+| 🔄 En review | Incremental learning XGBoost (#36) | 2026-05-07 | Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
 | ⏳ Pendiente | #18 Segundo dataset del RFC | - | Información complementaria, no obligatorio |
 | ⏳ Pendiente | #9 + #10 Quick wins (eval desagregada + feature importance) | - | Mismo PR, toca `evaluate_model` |
 | ⏳ Pendiente | #16 CI/CD básico | - | GitHub Actions con tests + lint |
@@ -265,7 +265,7 @@ Reemplaza el filtro manual por un param `exclude_years=[2020]` por default. **De
 
 ---
 
-### En desarrollo — #31 Reporte de model decay con Evidently AI
+### #31 — Reporte de model decay con Evidently AI (mergeado 2026-05-01)
 
 **Rama:** `feature/model-decay-monitor`
 **Inicio:** 2026-04-30
@@ -429,6 +429,46 @@ PSI es el threshold estándar de la industria (PSI < 0.1 sin drift, 0.1-0.25 mod
 2. Verificar artefactos: HTML del reporte en MLFlow + métricas `monitor_r2`, `monitor_drift_share`, `monitor_r2_delta`.
 3. Commitear y abrir PR con CODEOWNERS auto-asignando review.
 4. Reiniciar `api-1` después del DAG para volver al setup completo.
+
+---
+
+### En desarrollo — #36 Incremental learning con XGBoost
+
+**Rama:** `feature/incremental-learning-xgboost`
+**Inicio:** 2026-05-02
+**Estado:** validación end-to-end completa ✅, PR pendiente de abrir.
+**Resuelve:** OOM estructural de `RandomForestRegressor.fit()` al entrenar con histórico extenso.
+
+#### Cambio conceptual
+
+Random Forest es un *bagging ensemble*: cada árbol se entrena sobre un bootstrap sample del dataset completo. La limitación de memoria es **algorítmica, no de implementación**: necesita acceso simultáneo a todo el dataset al armar cada árbol y por eso no tiene `partial_fit`. Con eso, entrenar localmente con histórico extenso (~2019 en adelante) era inviable.
+
+XGBoost es un *gradient boosting ensemble* construido secuencialmente: cada árbol nuevo aprende del error residual del modelo anterior. Esa propiedad permite *continuation*: cargar un modelo previo y agregarle árboles nuevos entrenando solo con un chunk de datos. La memoria queda acotada por el tamaño del chunk + el booster (chico, < 10 MB), no por el dataset total.
+
+**Aclaración:** la mejora no viene de cambiar el modelo solo. XGBoost con `xgb.fit(dataset_completo)` reproduce el mismo OOM. Son **dos cambios juntos**: (1) algoritmo que soporte continuación, y (2) bucle que itere el dataset por chunks.
+
+#### Decisiones tomadas durante la implementación
+
+1. **XGBoost sobre SGDRegressor.** SGDRegressor mantiene memoria estrictamente constante via `partial_fit`, pero es lineal — pierde la capacidad no-lineal valiosa para los features de ventana (`avg_prod_*_10m`, `last_prod_*`) y estáticos (`profundidad`). El tradeoff de memoria estrictamente constante no compensa la pérdida predictiva.
+2. **Chunks mensuales en orden temporal.** El split de Feast ya provee `event_timestamp`; iterar por mes es natural. El orden cronológico es deliberado: los meses recientes pesan más en el modelo final, lo cual es coherente con el caso de uso (predecir el mes siguiente).
+3. **`n_estimators_per_chunk` en lugar de `n_estimators`.** En XGBoost continuation, el parámetro pasa a ser "árboles a agregar por chunk", no "total". Con dataset de ~10 meses de train, `n_estimators_per_chunk=10` produce ~100 árboles totales. Renombrar el parámetro evita confusión.
+4. **`learning_rate=0.1`** (default de XGB es 0.3). Más conservador para que ningún chunk individual domine al modelo final.
+5. **Formato `.ubj` en MLFlow** (no pickle). `mlflow.xgboost.log_model(model_format="ubj")` preserva metadata específica de XGBoost y es portable entre versiones.
+6. **`event_timestamp` en X_train/X_test.** Para que `train_model` pueda iterar por mes. En las tasks que entrenan/predicen se filtra a `[features]` antes de pasar al modelo, así que nunca llega como feature.
+7. **`LabelEncoder` se mantiene** para `tipoextraccion`. XGBoost lo trata como ordinal numérico (subóptimo pero funciona). Migrar a `enable_categorical=True` queda para [issue #13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13).
+
+#### Validación end-to-end (run `manual__2026-05-07T22:22:24`)
+
+- **DAG completó exitosamente** las 27 tareas (download, prepare, online_store, split, 10 × train+evaluate, select_best_model, monitor_model). 0 fallos.
+- **Training:** ejemplo del primer experimento (prod_pet, 5 árboles/chunk): 31.940 samples procesados en **9 chunks mensuales**, 45 árboles totales en el modelo final.
+- **monitor_model:** R²=0.869 (gas), R²=0.895 (pet). Por encima del floor 0.85. drift_share=0.0 (PSI < 0.1 en todas las features, esperable porque train y test son del mismo año).
+- **Comparación con RandomForest anterior:** RF logra 0.872/0.910, XGBoost logra 0.869/0.895. Caída marginal (~0.3% / ~1.5%) explicable por el menor número de árboles totales (45-90 vs 100) y `learning_rate=0.1` conservador. Tradeoff aceptable a cambio de poder escalar en memoria.
+- **Memoria:** training en chunks no provocó picos de RAM perceptibles, a diferencia del RF que generaba presión cerca del límite.
+
+#### Lo que NO resuelve esta feature
+
+- OOM en `prepare_offline_store` (carga del CSV + `groupby` + `rolling` con pandas in-memory). Es un cuello de botella separado, antes del training. Issue futura: refactorear a procesamiento por chunks o usar Dask/Polars.
+- Presión de RAM por containers simultáneos. Sigue siendo necesario parar `api-1` durante el DAG run o subir RAM de Docker Desktop.
 
 ---
 

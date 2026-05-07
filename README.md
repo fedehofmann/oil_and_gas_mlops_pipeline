@@ -595,6 +595,49 @@ Esto permite seguir la evolución del modelo a lo largo de los runs mensuales di
 - **Snapshot del dataset del run anterior como `reference` de Evidently** (en lugar de train). Sería una comparación más fiel al concepto de drift en producción, pero requiere persistir el parquet de cada run.
 - **Score compuesto** (R² + RMSE + bias) en `select_best_model` para que la promoción a producción sea más robusta que solo R². El roadmap de la entrega lo describe; queda como issue separada.
 
+### 13. Migración a XGBoost con incremental learning por chunks mensuales
+
+El proyecto usaba `RandomForestRegressor`, que carga el dataset completo en RAM al hacer `fit()`. Esa limitación no es de implementación: **es estructural al algoritmo**. Random Forest es un *bagging ensemble* donde cada árbol se entrena sobre un bootstrap sample del dataset completo, por lo que necesita acceso simultáneo a todo. No tiene `partial_fit` y no puede tenerlo. Con eso, entrenar localmente con histórico extenso (~2019 en adelante) era inviable: rompía por OOM.
+
+**Por qué XGBoost.** Es un *gradient boosting ensemble* construido secuencialmente: cada árbol nuevo aprende del error residual del modelo anterior. Esa propiedad permite hacer *continuation*: cargar un modelo previo y agregarle árboles entrenando solo con un chunk nuevo, sin tocar los anteriores. La memoria queda acotada por el tamaño del chunk, no por el dataset total.
+
+| Esquema | Memoria peak | Limitante |
+|---|---|---|
+| RandomForest + dataset completo (anterior) | `sizeof(dataset) + sizeof(modelo)` | Si el dataset > RAM → OOM, sin escape posible. |
+| XGBoost incremental por chunks (actual) | `sizeof(chunk) + sizeof(booster_creciente)` | Acotada por `chunk_size`, independiente del dataset total. |
+
+**Aclaración importante:** la mejora de memoria viene de **dos cambios juntos**: (1) cambiar el algoritmo a uno que soporte continuación, y (2) cambiar el bucle de entrenamiento de "un fit con todo" a "N fits, uno por chunk". XGBoost con `xgb.fit(dataset_completo)` reproduce el mismo OOM que RandomForest. Es la combinación lo que reduce memoria.
+
+**Implementación.** En `train_model`:
+
+1. El dataset de train (que ya viene con `event_timestamp` desde `split_data`) se agrupa por mes en orden cronológico.
+2. Para cada chunk mensual, se hace `XGBRegressor(...).fit(X_chunk, y_chunk, xgb_model=booster_path)`.
+3. El booster se guarda en formato `.ubj` (nativo de XGBoost) en disco después de cada chunk; ese path se pasa al chunk siguiente.
+4. Al final, el booster final tiene `n_estimators_per_chunk × n_chunks` árboles totales y se loguea en MLFlow vía `mlflow.xgboost.log_model(model_format="ubj")`.
+
+El orden cronológico es deliberado: los meses recientes pesan más en el modelo final, lo cual es coherente con el caso de uso de inferencia (predecir el mes siguiente).
+
+**Por qué XGBoost sobre SGDRegressor.** SGDRegressor también soporta `partial_fit` y mantiene memoria estrictamente constante, pero es **lineal** — pierde la capacidad de capturar relaciones no-lineales entre features de ventana (`avg_prod_gas_10m`, `last_prod_gas`) y features estáticas (`profundidad`, `tipoextraccion`). Esa pérdida sería significativa en producción de hidrocarburos donde las relaciones no son lineales.
+
+**Hiperparámetros que cambiaron respecto a RandomForest:**
+
+| RandomForest (anterior) | XGBoost (actual) | Notas |
+|---|---|---|
+| `n_estimators=100` (total de árboles del modelo final) | `n_estimators_per_chunk=10` (árboles a agregar por mes) | Pitfall: en continuation, `n_estimators` es árboles a agregar, **no total**. Con dataset de ~10 meses de train, llegamos a ~100 árboles totales. |
+| `max_depth=10` o `None` | `max_depth=6` (default XGB) | XGBoost tiende a generalizar mejor con árboles más conservadores. |
+| (no aplica) | `learning_rate=0.1` | RF no tiene equivalente. Default de XGB es 0.3 — agresivo para incremental. 0.1 es más estable: ningún chunk individual domina. |
+
+**Trade-offs aceptados:**
+
+- El booster crece con cada chunk (más árboles), pero el crecimiento es chico en términos absolutos — con `max_depth=6` y 100 árboles, el booster pesa < 10 MB.
+- `tipoextraccion` se sigue encodando con `LabelEncoder` (entero ordinal). XGBoost lo trata como ordinal numérico — subóptimo pero funciona. Migrar a `enable_categorical=True` con `pd.Categorical` queda para [issue #13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13).
+- La API de inferencia (`api/main.py`) carga ahora con `mlflow.xgboost.load_model` en lugar de `mlflow.sklearn.load_model` — cambio chico, transparente al cliente.
+
+**Lo que NO resuelve este cambio:**
+
+- El OOM en `prepare_offline_store` (carga del CSV completo + `groupby` + `rolling` con pandas in-memory). Eso es un cuello de botella separado, antes del training. Issue futura: refactorear ese task a procesamiento por chunks o usar Dask/Polars.
+- El OOM por presión total de containers (Ray Serve + entrenamiento + Evidently corriendo simultáneamente). Se mitiga parando `api-1` durante el DAG run o subiendo la RAM asignada a Docker Desktop.
+
 ---
 
 ## Feature Store

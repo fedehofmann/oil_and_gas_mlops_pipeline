@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from feast import FeatureStore
 from ray import serve
-import mlflow.sklearn
+import mlflow.xgboost
 import pandas as pd
 import os
 import time
@@ -36,9 +36,11 @@ class APIDeployment:
     """
 
     def __init__(self):
-        # Cargamos ambos modelos desde MLFlow una sola vez por réplica
-        self.model_gas = mlflow.sklearn.load_model("models:/oil_gas_prod_gas@production")
-        self.model_pet = mlflow.sklearn.load_model("models:/oil_gas_prod_pet@production")
+        # Cargamos ambos modelos XGBoost desde MLFlow una sola vez por réplica.
+        # El registro usa formato .ubj (nativo de XGBoost) — más portable entre versiones
+        # que pickle de RandomForest, que era el approach previo a #36.
+        self.model_gas = mlflow.xgboost.load_model("models:/oil_gas_prod_gas@production")
+        self.model_pet = mlflow.xgboost.load_model("models:/oil_gas_prod_pet@production")
 
         # Feature store client también reutilizable entre requests
         self.store = FeatureStore(repo_path = FEATURE_STORE_REPO)
