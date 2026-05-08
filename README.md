@@ -35,7 +35,7 @@ El DAG excluye automáticamente el año 2020 del entrenamiento (param `exclude_y
 
 ### Modelo y métricas
 
-Se entrenan dos modelos independientes (`prod_gas` y `prod_pet`) usando **RandomForestRegressor**. Se evalúan 10 experimentos en total (5 por target) variando `n_estimators`, `max_depth` y el conjunto de features. El modelo con mejor R² es promovido automáticamente a producción en MLFlow.
+Se entrenan dos modelos independientes (`prod_gas` y `prod_pet`) usando **XGBoost con incremental learning por chunks mensuales**. Se evalúan 10 experimentos en total (5 por target) variando `n_estimators_per_chunk`, `max_depth` y el conjunto de features. El modelo con mejor R² es promovido automáticamente a producción en MLFlow. La elección de XGBoost sobre RandomForest está motivada por la necesidad de mantener el uso de RAM acotado al tamaño del chunk en lugar del dataset completo — ver [Decisión #13](#13-migración-a-xgboost-con-incremental-learning-por-chunks-mensuales).
 
 Las métricas de evaluación son **R²**, **RMSE** y **MAE** sobre un test set temporal (20% de fechas más recientes).
 
@@ -663,6 +663,32 @@ La pérdida vs RandomForest no se cierra tuneando — se cierra dándole **más 
 
 - El OOM en `split_data` y `prepare_offline_store` (Feast + pandas in-memory cargando todo el dataset). Es el siguiente cuello de botella prioritario y desbloquea entrenar con histórico extenso + sumar el segundo dataset (#18). Issue separado para tomar después.
 - El OOM por presión total de containers (Ray Serve + entrenamiento + Evidently corriendo simultáneamente). Se mitiga parando `api-1` durante el DAG run o subiendo la RAM asignada a Docker Desktop.
+
+### 14. Human-in-the-Loop y Active Learning no aplican a este caso de uso
+
+La Clase 7 de la materia cubre Human-in-the-Loop (HITL) y Active Learning como pilares de MLOps en muchos casos reales. Este proyecto **no implementa** ninguno de los dos, y la decisión es estructural sobre la naturaleza del problema, no una omisión.
+
+#### Por qué no aplica HITL
+
+HITL asume que la **anotación humana** es parte del pipeline: hay datos sin label, humanos los etiquetan, y esas etiquetas alimentan el reentrenamiento. Es el patrón estándar en clasificación de imágenes, NLP, detección de objetos, moderación de contenido, etc.
+
+Acá el ground truth es **medido instrumentalmente**: la producción mensual de cada pozo (en m³) se reporta a la Secretaría de Energía como dato regulatorio, derivado de medidores físicos en boca de pozo y sistemas SCADA de las operadoras. No hay anotador, no hay subjetividad, no hay desacuerdo posible entre etiquetadores. El label es lo que el medidor registró.
+
+Como consecuencia, no aplican: anotadores in-house vs BPO vs crowdsourcing, Krippendorff's alpha / acuerdo entre anotadores, golden tasks para auditar trabajadores, agregación de votos por mayoría, ni el diseño de UI de anotación.
+
+#### Por qué no aplica Active Learning
+
+Active Learning sirve para **decidir qué muestras sin etiquetar mandar a anotación primero**, optimizando el retorno por hora de anotador. Tres precondiciones:
+
+1. Hay un pool grande de datos sin etiqueta.
+2. Etiquetarlos cuesta (humano + tiempo).
+3. Se puede medir la incertidumbre del modelo sobre ellos para priorizar.
+
+Ninguna se cumple acá. Todos los pozos activos vienen ya etiquetados en el dataset oficial cada mes. No hay un pool de pozos "sin label" esperando que alguien decida cuáles entrenar primero. Las técnicas específicas (least confidence, margin sampling, entropy, query by committee, muestreo por diversidad / clusters / outliers) no tienen donde aplicarse.
+
+#### Lo que sí podría tener sentido en una iteración futura
+
+Una conexión genuina con el espíritu de la clase es **cuantificar la incertidumbre de las predicciones** para que el operador sepa cuán confiado está el modelo en cada respuesta. XGBoost soporta nativamente *quantile regression* (`objective="reg:quantileerror"`), lo que permitiría devolver `(q10, q50, q90)` en lugar de un punto. Es una mejora real de UX para el consumidor de la API y se conecta con la idea de "incertidumbre epistémica vs aleatoria" de la slide 71. Queda registrado como reflexión arquitectónica para una segunda iteración pero fuera del alcance de esta entrega.
 
 ---
 
