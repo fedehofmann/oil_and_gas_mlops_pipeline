@@ -13,20 +13,52 @@
 | ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
 | ✅ Mergeado | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-05-01 | Mergeado en PR #35. Cubre obligatorio del RFC con R² delta + drift_share via PSI |
 | 🔄 En review | Incremental learning XGBoost (#36) | 2026-05-07 | PR #37 abierto. Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
-| ⏳ Pendiente | #18 Segundo dataset del RFC | - | Información complementaria, no obligatorio |
-| ⏳ Pendiente | #9 + #10 Quick wins (eval desagregada + feature importance) | - | Mismo PR, toca `evaluate_model` |
-| ⏳ Pendiente | #16 CI/CD básico | - | GitHub Actions con tests + lint |
-| ⏳ Pendiente | #11 OpenAPI descriptions | - | Solo `main.py` |
-| ⏳ Pendiente | #13 LabelEncoder como artefacto | - | Persistir como pickle en MLFlow |
-| ⏳ Pendiente | #14 Validación de schema | - | `pandera` en `download_dataset` |
-| ⏳ Pendiente | #15 Prediction logging | - | CSV/SQLite en `main.py` |
-| ⏳ Pendiente | #17 Point-in-Time correct | - | Más complejo, solo si hay tiempo |
+**Pendientes consolidados en el [Backlog priorizado](#backlog-priorizado) más abajo** — incluye los issues del roadmap original (#9, #10, #11, #13, #14, #15, #16, #17, #18) y los detectados durante reviews de las clases 6, 7 y 8 (#26, #27, #28, #38, #39, #40-44, #46-48).
 
 **Notas sobre la evolución del scope:**
 
 - **#6 (Ray Serve):** ya implementado en [PR #29](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/pull/29). Era obligatorio del RFC (arquitectura escalable para inferencia).
 - **#7 + #8 + #30 consolidados en #31 (Evidently AI):** inicialmente se planteaban tres issues separados — reporte propio de model decay (#7), threshold configurable (#8) y drift detection con `alibi-detect` (#30). Al evaluar la implementación apareció Evidently AI, que cubre las tres cosas con una única librería (regression performance + data drift + tests asertivos con umbrales). Se cerró #30 y se consolidó todo el scope en #31, lo cual simplifica la arquitectura y reduce el mantenimiento.
 - **#23 (filtro COVID 2020):** cubierto en [PR #25](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/pull/25) con un mecanismo más general (`exclude_years` en lugar de hardcodear 2020).
+
+---
+
+## Backlog priorizado
+
+Issues abiertos ordenados por importancia. Los dos obligatorios del RFC ya están cerrados (#29 Ray Serve + #31 Evidently), por lo que esta priorización refleja **valor incremental** sobre el sistema, no urgencia para la entrega.
+
+Criterio de los niveles:
+
+- **P1 — Operativos críticos**: previenen fallos silenciosos y endurecen el sistema. Bajo esfuerzo, alto impacto preventivo.
+- **P2 — Observabilidad y monitoreo**: dan visibilidad sobre qué pasa en producción y completan el monitoreo iniciado en #31.
+- **P3 — Calidad del pipeline**: cierran gaps de best practices identificados en el README y reviews.
+- **P4 — Robustez estructural**: cambios más invasivos pero importantes para escala (memoria, CI/CD, point-in-time).
+- **P5 — Optimizaciones data-driven**: requieren datos previos (latencia medida, asimetría observada) para justificarse — abrir solo cuando haya evidencia.
+
+| Prioridad | Issue | Notas |
+|---|---|---|
+| **P1** | [#46](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/46) Alerta de modelo stale | Detecta DAG fallando silenciosamente. Endpoint `/health/staleness` o tarea Airflow independiente. Origen: Clase 7, Caso 1 YarnIt. |
+| **P1** | [#47](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/47) Validación de outputs (NaN / rangos físicos) | Defensivo. Evita devolver predicciones absurdas (negativas, NaN) al consumidor. Origen: Clase 7, slide 62. |
+| **P1** | [#14](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/14) Validación de schema CSV con pandera | Detecta cambios upstream en el dataset MINEM antes de romper en una tarea posterior. Origen: roadmap original. |
+| **P1** | [#42](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/42) Health check + graceful degradation | Endpoints `/health/live` y `/health/ready` + fallback al modelo cacheado en disco. Origen: Clase 6, slides 36 y 52. |
+| **P1** | [#41](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/41) Autenticación API key | Hoy `/api/v1/*` están abiertos. Mínimo: `X-API-Key` validado contra `.env`. Origen: Clase 6, slide 52. |
+| **P2** | [#40](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/40) Métricas de latencia P50/P90/P99 | Prerrequisito para definir SLA y para validar #27/#28. Origen: Clase 6, slides 7, 27, 52. |
+| **P2** | [#44](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/44) Logs operacionales estructurados (JSON) | Distinto de #15: logs de sistema, no de predicciones. Base para debugging serio. Origen: Clase 6, slide 51. |
+| **P2** | [#15](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/15) Prediction logging en API | CSV/SQLite con `(id_well, date, target, pred, features, timestamp)`. Habilita análisis de drift en producción. Origen: roadmap original. |
+| **P2** | [#48](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/48) Bias y calibration en `monitor_model` | Completa la tríada de canary metrics. Hoy hay R² delta + drift_share, faltan bias y calibración por bucket. Origen: Clase 7, slide 11. |
+| **P2** | [#43](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/43) Prometheus + Grafana | Stack estándar para observabilidad operativa. Depende de #40 (necesita endpoint `/metrics`). Origen: Clase 6, slide 51. |
+| **P3** | [#9](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/9) Eval desagregada por `tipoextraccion` | Quick win en `evaluate_model`. Detecta disparate impact por subgrupo. Origen: roadmap original (ética IA). |
+| **P3** | [#10](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/10) Feature importance en MLFlow | Quick win, mismo PR que #9. Una línea por feature por target. Origen: roadmap original (XAI). |
+| **P3** | [#13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13) LabelEncoder como artefacto | Cierra training-serving skew latente si aparecen nuevas categorías de `tipoextraccion`. Origen: roadmap original. |
+| **P3** | [#11](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/11) OpenAPI descriptions en endpoints | Mejora usabilidad del Swagger UI con descriptions y ejemplos por param. Origen: roadmap original. |
+| **P4** | [#38](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/38) Refactor `split_data` y `prepare_offline_store` por chunks | El siguiente bottleneck post-XGBoost — Feast cargando todo en RAM. Habilita entrenar con 3+ años. Origen: bitácora #36. |
+| **P4** | [#16](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/16) CI/CD básico con GitHub Actions | Tests + lint + validación de schema en cada PR. Lleva al Nivel 2 de MLOps. Origen: roadmap original. |
+| **P4** | [#17](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/17) Point-in-Time correct con `entity_df` en Feast | Robustez del entrenamiento ante mutaciones retroactivas del dataset upstream. Origen: roadmap original. |
+| **P4** | [#18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18) Segundo dataset del RFC | Metadata estructural por pozo (formación, cuenca, empresa). Complementa el modelo. Origen: roadmap original. |
+| **P5** | [#27](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/27) Cache de inferencia con Redis | Optimización condicional. Justificada solo si #40 muestra que la CPU del API es bottleneck. Origen: Clase 6. |
+| **P5** | [#28](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/28) Autoscaling dinámico de Ray Serve | Optimización condicional. Justificada solo si #40 muestra utilización desigual. Origen: Clase 6. |
+| **P5** | [#26](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/26) Separación de deployments gas/pet | Justificada solo si #15 muestra asimetría sostenida de carga entre fluidos. Origen: Clase 6 / Decisión #10 README. |
+| **P5** | [#39](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/39) Adaptive Isolation Forest | Exploratorio para `monitor_model`. No aplica directamente al caso de uso (no es clasificación de fraude). Origen: Clase 7. |
 
 ---
 
