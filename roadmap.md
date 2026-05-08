@@ -11,8 +11,8 @@
 | ✅ Mergeado | #24 Cierre de #12 (CSV hash) | 2026-04-30 | Supuesto de inmutabilidad aceptado |
 | ✅ Mergeado | #29 Ray Serve (cubre #6 obligatorio) | 2026-04-30 | `num_replicas=2` unificado |
 | ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
-| 🔄 En curso | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-04-30 | Rama `feature/model-decay-monitor` |
-| 🔄 En review | Incremental learning XGBoost (#36) | 2026-05-07 | Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
+| ✅ Mergeado | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-05-01 | Mergeado en PR #35. Cubre obligatorio del RFC con R² delta + drift_share via PSI |
+| 🔄 En review | Incremental learning XGBoost (#36) | 2026-05-07 | PR #37 abierto. Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
 | ⏳ Pendiente | #18 Segundo dataset del RFC | - | Información complementaria, no obligatorio |
 | ⏳ Pendiente | #9 + #10 Quick wins (eval desagregada + feature importance) | - | Mismo PR, toca `evaluate_model` |
 | ⏳ Pendiente | #16 CI/CD básico | - | GitHub Actions con tests + lint |
@@ -32,10 +32,10 @@
 
 ## Requerimientos obligatorios pendientes
 
-Tras releer el RFC, los obligatorios (DEBE) están todos en marcha o cerrados:
+Tras releer el RFC, los dos obligatorios (DEBE) están cerrados:
 
 - ✅ **Arquitectura escalable de inferencia (Ray):** cubierto por #29 (Ray Serve) — mergeado.
-- 🔄 **Reporte de model decay / data drift con al menos dos métricas:** en curso en #31 (Evidently AI).
+- ✅ **Reporte de model decay / data drift con al menos dos métricas:** cubierto por #31 (Evidently AI) — mergeado en PR #35 (2026-05-01).
 
 ---
 
@@ -43,9 +43,9 @@ Tras releer el RFC, los obligatorios (DEBE) están todos en marcha o cerrados:
 
 **Requisito:** El sistema DEBE dar un reporte de model decay, data drift / concept drift con al menos dos métricas que permitan observar cuándo la performance del modelo se aleja de la esperada.
 
-**Estado:** ❌ No implementado.
+**Estado:** ✅ Implementado en #31 (mergeado en PR #35, 2026-05-01). Ver bitácora más abajo para el detalle de decisiones e iteraciones. La sección a continuación es la propuesta original de diseño que guió la implementación.
 
-**Propuesta de implementación:**
+**Propuesta de implementación original:**
 
 Agregar una tarea `monitor_model` al final del DAG (después de `select_best_model`) que compare el modelo recién entrenado contra la versión anterior en producción y genere un reporte con estas métricas:
 
@@ -79,9 +79,9 @@ La ponderación refleja prioridades del problema: R² es el indicador principal 
 
 **Requisito:** El sistema DEBE implementar una arquitectura escalable para responder la inferencia de la API (ej: Ray).
 
-**Estado:** ❌ No implementado. La API actual corre con un único proceso uvicorn dentro del contenedor Airflow.
+**Estado:** ✅ Implementado en #29 (mergeado 2026-04-30) con Ray Serve + FastAPI, `num_replicas=2` unificado. Ver Decisión #10 del README para el detalle arquitectónico. La sección a continuación es la propuesta original que guió la implementación.
 
-**Propuesta de implementación:**
+**Propuesta de implementación original:**
 
 Reemplazar el servidor uvicorn simple por Ray Serve:
 
@@ -269,7 +269,7 @@ Reemplaza el filtro manual por un param `exclude_years=[2020]` por default. **De
 
 **Rama:** `feature/model-decay-monitor`
 **Inicio:** 2026-04-30
-**Estado:** En desarrollo, validación en curso del DAG end-to-end.
+**Estado:** ✅ Mergeado en PR #35 (2026-05-01). Cierra obligatorio del RFC.
 **Cubre obligatorio del RFC:** "El sistema DEBE dar un reporte de model decay / data drift con al menos dos métricas que permitan observar cuándo la performance del modelo se aleja de la esperada."
 **Consolida issues:** #7 (model decay report), #8 (threshold configurable), motivación de #30 (alibi-detect, cerrado).
 
@@ -423,20 +423,20 @@ PSI es el threshold estándar de la industria (PSI < 0.1 sin drift, 0.1-0.25 mod
 
 **Lección general:** para data drift en pipelines automáticos donde el tamaño de muestra varía de un run a otro, **preferir métricas de magnitud sobre tests de hipótesis**. Los p-values son útiles para decisiones puntuales con muestras chicas; las métricas de magnitud son más robustas en producción.
 
-#### Próximos pasos para cerrar #31
+#### Cómo se cerró #31
 
-1. Validar la corrida end-to-end después del fix de Evidently 0.6.7.
-2. Verificar artefactos: HTML del reporte en MLFlow + métricas `monitor_r2`, `monitor_drift_share`, `monitor_r2_delta`.
-3. Commitear y abrir PR con CODEOWNERS auto-asignando review.
-4. Reiniciar `api-1` después del DAG para volver al setup completo.
+1. ✅ Validada la corrida end-to-end después del fix de Evidently 0.6.7.
+2. ✅ Verificados artefactos: HTML del reporte en MLFlow + métricas `monitor_r2`, `monitor_drift_share`, `monitor_r2_delta`.
+3. ✅ PR abierto, revisado y mergeado como PR #35.
+4. ✅ Setup completo restaurado tras el DAG run.
 
 ---
 
-### En desarrollo — #36 Incremental learning con XGBoost
+### 🔄 En review — #36 Incremental learning con XGBoost
 
 **Rama:** `feature/incremental-learning-xgboost`
 **Inicio:** 2026-05-02
-**Estado:** validación end-to-end completa ✅, PR pendiente de abrir.
+**Estado:** validación end-to-end completa ✅, PR #37 abierto y en review.
 **Resuelve:** OOM estructural de `RandomForestRegressor.fit()` al entrenar con histórico extenso.
 
 #### Cambio conceptual
