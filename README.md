@@ -690,6 +690,44 @@ Ninguna se cumple acá. Todos los pozos activos vienen ya etiquetados en el data
 
 Una conexión genuina con el espíritu de la clase es **cuantificar la incertidumbre de las predicciones** para que el operador sepa cuán confiado está el modelo en cada respuesta. XGBoost soporta nativamente *quantile regression* (`objective="reg:quantileerror"`), lo que permitiría devolver `(q10, q50, q90)` en lugar de un punto. Es una mejora real de UX para el consumidor de la API y se conecta con la idea de "incertidumbre epistémica vs aleatoria" de la slide 71. Queda registrado como reflexión arquitectónica para una segunda iteración pero fuera del alcance de esta entrega.
 
+### 15. Streaming / Continual Learning sub-mensual no aplica a este caso de uso
+
+La Clase 8 cubre aprendizaje sobre streams de datos: ingesta continua vía Kafka / Pub-Sub, motores de procesamiento como Flink (sub-milisegundo) o Spark Streaming (segundos), continual learning con algoritmos single-pass (Hoeffding Trees, FTRL-Proximal, SGD incremental) y frameworks como Vowpal Wabbit o River ML. Este proyecto **no** implementa ninguno de esos componentes a esa cadencia, y la decisión es estructural sobre el dominio.
+
+#### Por qué no aplica streaming a sub-segundo / sub-milisegundo
+
+Streaming asume tres condiciones que justifican el costo de la infraestructura asociada:
+
+1. **Ingesta continua de eventos**: clicks, transacciones, mensajes, sensores. Decenas o miles de eventos por segundo.
+2. **Costo de oportunidad por latencia**: la decisión de negocio pierde valor si tarda segundos (ads/recomendaciones, fraude, dynamic pricing — slide 7 de la clase).
+3. **Cadencia rápida del mundo real**: el fenómeno modelado cambia a la velocidad de los eventos.
+
+Ninguna se cumple acá:
+
+1. **Los datos vienen mensualmente** del Ministerio de Energía como dataset estructurado del régimen regulatorio. No hay un stream de eventos por segundo — hay 12 actualizaciones del dataset por año.
+2. **El consumidor de la API es un analista de producción o un dashboard de planificación**, no un loop de control que decide en milisegundos. La latencia tolerable es de segundos (ver SLA en Decisión #10), no de microsegundos.
+3. **La producción de un pozo cambia a escala de meses**, no de segundos. Un decline rate típico se mide en porcentaje mensual, y las decisiones operativas (workover, intervención, abandono) se toman en horizontes de semanas a meses.
+
+#### Por qué tampoco aplica continual learning sub-mensual
+
+Continual learning *sub-mensual* (actualizar el modelo cada hora / día / minuto a partir de eventos individuales) tiene los mismos prerrequisitos que streaming, más uno propio: **la dinámica del fenómeno tiene que cambiar lo suficientemente rápido como para que valga la pena reentrenar entre ciclos batch**. En oil & gas no es así: los reportes regulatorios son mensuales, las features de ventana (`avg_prod_*_10m`) usan ventanas de 10 meses, el target es producción mensual. Reentrenar más seguido no agrega información — los datos no llegan más rápido que el ciclo del DAG.
+
+#### Lo que sí está implementado del concepto: continual learning a cadencia mensual
+
+Conviene aclarar que **el proyecto sí implementa continual learning, pero a la cadencia natural del dominio (mensual)**, no en streaming. La Decisión #13 (XGBoost incremental por chunks mensuales) implementa exactamente la idea de "actualizar el modelo con cada chunk nuevo de datos sin recargar el histórico completo en memoria" — el chunk es un mes en lugar de un evento. Esa decisión cubre el principio de la clase 8 (memoria acotada, single-pass por chunk) ajustado a la cadencia del problema.
+
+#### Trade-offs frente a streaming real
+
+| Aspecto | Streaming real (no implementado) | Mensual con XGBoost incremental (elegido) |
+|---|---|---|
+| Latencia de actualización del modelo | Segundos a minutos | Un mes (cuando corre el DAG) |
+| Frescura de features | Sub-segundo (Redis + OLAP) | Mensual (Feast online store, SQLite) |
+| Infra requerida | Kafka + Flink + Redis + OLAP DB + cluster 24/7 | Airflow + MLflow + Feast + Ray Serve |
+| Costo operativo (OpEx) | Alto sostenido (slide 49 de la clase) | Bajo, escala con triggers del DAG |
+| Justificación de negocio | Necesaria si la latencia importa para la decisión | No necesaria — el horizonte es mensual |
+
+La slide 50 de la clase plantea exactamente este trade-off: "si un modelo XGBoost estático alcanza 86 % y la variante en streaming logra 88 %, el impacto de negocio de ese +2 % debe justificar el aumento de infraestructura". En este caso, ese +2 % no compensa el orden de magnitud de complejidad operativa que sumaría streaming. La conclusión coincide con la slide 51 de la clase: continual learning aplica para "motores publicitarios, pricing dinámico, mercados financieros, ciberseguridad" — no para predicción de producción regulatoria con cadencia mensual.
+
 ---
 
 ## Feature Store
