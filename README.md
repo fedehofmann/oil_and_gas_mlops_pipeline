@@ -363,6 +363,26 @@ Para resolverlo correctamente habría que entrenar con features de T y target de
 
 La inferencia del modelo debe responder a consultas externas con latencia acotada, escalar ante picos de demanda, tolerar la caída de una instancia sin perder servicio, y no pagar el costo de cargar el modelo desde MLFlow en cada request. La implementación más simple (un proceso uvicorn único) no provee ninguna de esas propiedades. Se necesita un framework que separe el servidor HTTP del ciclo de vida del modelo, permita escalado horizontal declarativo, y gestione fallos automáticamente.
 
+#### Por qué inferencia real-time y no batch precomputation
+
+Una alternativa válida al serving real-time es **precomputar todas las predicciones en el DAG mensual** y servirlas desde una tabla rápida (Redis, Postgres, SQLite) — el patrón estándar en sistemas de recomendación, donde Booking, Spotify y Netflix calculan rankings offline por usuario y la API simplemente hace lookup. El caso de uso de este proyecto se ajusta más a ese patrón que al serving on-demand:
+
+- **Universo finito y conocido**: el conjunto de pozos activos cambia lentamente — del orden de cientos por mes en una operadora mediana.
+- **Horizonte de predicción mensual**: la API predice producción del mes T+1. No hay urgencia de respuesta en el orden de milisegundos.
+- **Reentrenamiento mensual**: las predicciones cambian cuando se promueve un modelo nuevo, no de forma continua.
+
+| Aspecto | Real-time (elegido) | Batch precomputation |
+|---|---|---|
+| Latencia por request | ms (inferencia + feature lookup) | μs (solo lookup en tabla) |
+| Costo en serve | CPU por cada request | CPU una vez por ciclo del DAG |
+| Flexibilidad de query | Cualquier rango de fechas, cualquier combinación de inputs | Solo lo que se precomputó |
+| Frescura ante updates | Refleja último modelo y features inmediatamente | Stale hasta el próximo run del DAG |
+| Complejidad operativa | Serving framework + autoscaling + fault tolerance | Tabla + invalidación al promover modelo |
+
+**Por qué se eligió real-time pese a lo anterior:** el RFC del proyecto pide explícitamente "una arquitectura escalable para responder la inferencia de la API (ej: Ray)" como requisito obligatorio. El objetivo pedagógico incluye mostrar el dominio del patrón de serving on-demand con todos sus trade-offs reales — capacity planning, latencia bajo carga, fault tolerance, autoscaling. La precomputación batch resuelve el caso de uso pero no permite ejercitar esas decisiones, que son precisamente las que se evalúan en el TP.
+
+**Patrón híbrido como evolución natural en producción real** (slide 22 de Clase 6, también lo que hace Booking en producción): precomputar el caso común — predicción del mes siguiente para todos los pozos activos — y dejar el path real-time únicamente para queries ad-hoc con rangos de fechas arbitrarios. Captura lo mejor de los dos mundos: latencia de μs para el 90 % del tráfico, flexibilidad real-time para el 10 % restante. Queda registrado como reflexión arquitectónica para una segunda iteración, pero fuera del alcance de esta entrega.
+
 #### Qué es Ray Serve y por qué se eligió
 
 [Ray Serve](https://docs.ray.io/en/latest/serve/index.html) es un framework de model serving distribuido construido sobre Ray Core. Su arquitectura interna tiene tres tipos de actores:
