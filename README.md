@@ -35,7 +35,7 @@ El DAG excluye automáticamente el año 2020 del entrenamiento (param `exclude_y
 
 ### Modelo y métricas
 
-Se entrenan dos modelos independientes (`prod_gas` y `prod_pet`) usando **RandomForestRegressor**. Se evalúan 10 experimentos en total (5 por target) variando `n_estimators`, `max_depth` y el conjunto de features. El modelo con mejor R² es promovido automáticamente a producción en MLFlow.
+Se entrenan dos modelos independientes (`prod_gas` y `prod_pet`) usando **XGBoost con incremental learning por chunks mensuales**. Se evalúan 10 experimentos en total (5 por target) variando `n_estimators_per_chunk`, `max_depth` y el conjunto de features. El modelo con mejor R² es promovido automáticamente a producción en MLFlow. La elección de XGBoost sobre RandomForest está motivada por la necesidad de mantener el uso de RAM acotado al tamaño del chunk en lugar del dataset completo — ver [Decisión #13](#13-migración-a-xgboost-con-incremental-learning-por-chunks-mensuales).
 
 Las métricas de evaluación son **R²**, **RMSE** y **MAE** sobre un test set temporal (20% de fechas más recientes).
 
@@ -614,6 +614,139 @@ Esto permite seguir la evolución del modelo a lo largo de los runs mensuales di
 
 - **Snapshot del dataset del run anterior como `reference` de Evidently** (en lugar de train). Sería una comparación más fiel al concepto de drift en producción, pero requiere persistir el parquet de cada run.
 - **Score compuesto** (R² + RMSE + bias) en `select_best_model` para que la promoción a producción sea más robusta que solo R². El roadmap de la entrega lo describe; queda como issue separada.
+
+### 13. Migración a XGBoost con incremental learning por chunks mensuales
+
+El proyecto usaba `RandomForestRegressor`, que carga el dataset completo en RAM al hacer `fit()`. Esa limitación no es de implementación: **es estructural al algoritmo**. Random Forest es un *bagging ensemble* donde cada árbol se entrena sobre un bootstrap sample del dataset completo, por lo que necesita acceso simultáneo a todo. No tiene `partial_fit` y no puede tenerlo. Con eso, entrenar localmente con histórico extenso (~2019 en adelante) era inviable: rompía por OOM.
+
+**Por qué XGBoost.** Es un *gradient boosting ensemble* construido secuencialmente: cada árbol nuevo aprende del error residual del modelo anterior. Esa propiedad permite hacer *continuation*: cargar un modelo previo y agregarle árboles entrenando solo con un chunk nuevo, sin tocar los anteriores. La memoria queda acotada por el tamaño del chunk, no por el dataset total.
+
+| Esquema | Memoria peak | Limitante |
+|---|---|---|
+| RandomForest + dataset completo (anterior) | `sizeof(dataset) + sizeof(modelo)` | Si el dataset > RAM → OOM, sin escape posible. |
+| XGBoost incremental por chunks (actual) | `sizeof(chunk) + sizeof(booster_creciente)` | Acotada por `chunk_size`, independiente del dataset total. |
+
+**Aclaración importante:** la mejora de memoria viene de **dos cambios juntos**: (1) cambiar el algoritmo a uno que soporte continuación, y (2) cambiar el bucle de entrenamiento de "un fit con todo" a "N fits, uno por chunk". XGBoost con `xgb.fit(dataset_completo)` reproduce el mismo OOM que RandomForest. Es la combinación lo que reduce memoria.
+
+**Implementación.** En `train_model`:
+
+1. El dataset de train (que ya viene con `event_timestamp` desde `split_data`) se agrupa por mes en orden cronológico.
+2. Para cada chunk mensual, se hace `XGBRegressor(...).fit(X_chunk, y_chunk, xgb_model=booster_path)`.
+3. El booster se guarda en formato `.ubj` (nativo de XGBoost) en disco después de cada chunk; ese path se pasa al chunk siguiente.
+4. Al final, el booster final tiene `n_estimators_per_chunk × n_chunks` árboles totales y se loguea en MLFlow vía `mlflow.xgboost.log_model(model_format="ubj")`.
+
+El orden cronológico es deliberado: los meses recientes pesan más en el modelo final, lo cual es coherente con el caso de uso de inferencia (predecir el mes siguiente).
+
+**Por qué XGBoost sobre SGDRegressor.** SGDRegressor también soporta `partial_fit` y mantiene memoria estrictamente constante, pero es **lineal** — pierde la capacidad de capturar relaciones no-lineales entre features de ventana (`avg_prod_gas_10m`, `last_prod_gas`) y features estáticas (`profundidad`, `tipoextraccion`). Esa pérdida sería significativa en producción de hidrocarburos donde las relaciones no son lineales.
+
+**Hiperparámetros que cambiaron respecto a RandomForest:**
+
+| RandomForest (anterior) | XGBoost (actual) | Notas |
+|---|---|---|
+| `n_estimators=100` (total de árboles del modelo final) | `n_estimators_per_chunk=10` (árboles a agregar por mes) | Pitfall: en continuation, `n_estimators` es árboles a agregar, **no total**. Con dataset de ~10 meses de train, llegamos a ~100 árboles totales. |
+| `max_depth=10` o `None` | `max_depth=6` (default XGB) | XGBoost tiende a generalizar mejor con árboles más conservadores. |
+| (no aplica) | `learning_rate=0.1` | RF no tiene equivalente. Default de XGB es 0.3 — agresivo para incremental. 0.1 es más estable: ningún chunk individual domina. |
+
+**Trade-offs aceptados:**
+
+- El booster crece con cada chunk (más árboles), pero el crecimiento es chico en términos absolutos — con `max_depth=6` y 100 árboles, el booster pesa < 10 MB.
+- `tipoextraccion` se sigue encodando con `LabelEncoder` (entero ordinal). XGBoost lo trata como ordinal numérico — subóptimo pero funciona. Migrar a `enable_categorical=True` con `pd.Categorical` queda para [issue #13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13).
+- La API de inferencia (`api/main.py`) carga ahora con `mlflow.xgboost.load_model` en lugar de `mlflow.sklearn.load_model` — cambio chico, transparente al cliente.
+
+**Validación cuantitativa con tres escenarios de rango temporal:**
+
+Para cuantificar el tradeoff vs RandomForest se corrió el DAG con tres rangos crecientes (A: 2 años, B: 3 años, C: 4 años efectivos) en ambos modelos, midiendo tiempo, RAM peak, R², RMSE y MAE.
+
+**Resumen ejecutivo (escenario A, único comparable):**
+
+| Modelo | Estado | Tiempo total | Tiempo `train_model` | RAM peak worker |
+|---|---|---|---|---|
+| **XGBoost incremental** | ✅ success | **244s** | **45s** | **2,99 GiB** |
+| RandomForest | ✅ success | 469s | 211s | 3,53 GiB |
+
+**Performance (escenario A):**
+
+| Modelo | R² gas | R² pet | RMSE gas (m³) | RMSE pet (m³) |
+|---|---|---|---|---|
+| XGBoost | 0,871 | 0,863 | 668,9 | 393,8 |
+| RandomForest | **0,923** | **0,902** | **517,4** | **334,4** |
+
+**Hallazgo principal:** en escenarios B y C (3-4 años) **ambos modelos fallan en `split_data`** — Feast cargando todo en memoria al hacer `get_historical_features`. El próximo cuello de botella se mueve del training al feature store. Lectura: XGBoost incremental cumplió su promesa de resolver el OOM del training, pero el siguiente bottleneck aparece antes en el pipeline.
+
+**Tuning fallido:** se intentó cerrar la brecha de performance vs RandomForest con configuraciones más agresivas (`max_depth=10`, `learning_rate=0,2`, más árboles). Todos los experimentos empeoraron — varios con R² negativo. La causa es overfitting estructural: con `max_depth` alto cada árbol es muy expresivo, y al acumular muchos chunks el modelo memoriza patrones locales de los meses finales (que coinciden con el test set por el split temporal). Conclusión: **la configuración elegida (`max_depth=6`, `learning_rate=0,1`, `est_pc=5`) está cerca del techo accesible con esta arquitectura**. La pérdida de ~5 pp en R² no es por subóptima configuración, es el costo intrínseco del incremental learning con árboles en este dataset.
+
+**Camino para cerrar la brecha de performance:**
+
+La pérdida vs RandomForest no se cierra tuneando — se cierra dándole **más datos** al modelo (entrenar con 3+ años) o **mejores features** (sumar el segundo dataset del RFC con metadata estructural por pozo). Ambas mejoras requieren resolver primero el bottleneck de Feast en `split_data`. Por eso la prioridad siguiente del proyecto pasa al feature store, no al modelo.
+
+**Lo que NO resuelve este cambio:**
+
+- El OOM en `split_data` y `prepare_offline_store` (Feast + pandas in-memory cargando todo el dataset). Es el siguiente cuello de botella prioritario y desbloquea entrenar con histórico extenso + sumar el segundo dataset (#18). Issue separado para tomar después.
+- El OOM por presión total de containers (Ray Serve + entrenamiento + Evidently corriendo simultáneamente). Se mitiga parando `api-1` durante el DAG run o subiendo la RAM asignada a Docker Desktop.
+
+### 14. Human-in-the-Loop y Active Learning no aplican a este caso de uso
+
+La Clase 7 de la materia cubre Human-in-the-Loop (HITL) y Active Learning como pilares de MLOps en muchos casos reales. Este proyecto **no implementa** ninguno de los dos, y la decisión es estructural sobre la naturaleza del problema, no una omisión.
+
+#### Por qué no aplica HITL
+
+HITL asume que la **anotación humana** es parte del pipeline: hay datos sin label, humanos los etiquetan, y esas etiquetas alimentan el reentrenamiento. Es el patrón estándar en clasificación de imágenes, NLP, detección de objetos, moderación de contenido, etc.
+
+Acá el ground truth es **medido instrumentalmente**: la producción mensual de cada pozo (en m³) se reporta a la Secretaría de Energía como dato regulatorio, derivado de medidores físicos en boca de pozo y sistemas SCADA de las operadoras. No hay anotador, no hay subjetividad, no hay desacuerdo posible entre etiquetadores. El label es lo que el medidor registró.
+
+Como consecuencia, no aplican: anotadores in-house vs BPO vs crowdsourcing, Krippendorff's alpha / acuerdo entre anotadores, golden tasks para auditar trabajadores, agregación de votos por mayoría, ni el diseño de UI de anotación.
+
+#### Por qué no aplica Active Learning
+
+Active Learning sirve para **decidir qué muestras sin etiquetar mandar a anotación primero**, optimizando el retorno por hora de anotador. Tres precondiciones:
+
+1. Hay un pool grande de datos sin etiqueta.
+2. Etiquetarlos cuesta (humano + tiempo).
+3. Se puede medir la incertidumbre del modelo sobre ellos para priorizar.
+
+Ninguna se cumple acá. Todos los pozos activos vienen ya etiquetados en el dataset oficial cada mes. No hay un pool de pozos "sin label" esperando que alguien decida cuáles entrenar primero. Las técnicas específicas (least confidence, margin sampling, entropy, query by committee, muestreo por diversidad / clusters / outliers) no tienen donde aplicarse.
+
+#### Lo que sí podría tener sentido en una iteración futura
+
+Una conexión genuina con el espíritu de la clase es **cuantificar la incertidumbre de las predicciones** para que el operador sepa cuán confiado está el modelo en cada respuesta. XGBoost soporta nativamente *quantile regression* (`objective="reg:quantileerror"`), lo que permitiría devolver `(q10, q50, q90)` en lugar de un punto. Es una mejora real de UX para el consumidor de la API y se conecta con la idea de "incertidumbre epistémica vs aleatoria" de la slide 71. Queda registrado como reflexión arquitectónica para una segunda iteración pero fuera del alcance de esta entrega.
+
+### 15. Streaming / Continual Learning sub-mensual no aplica a este caso de uso
+
+La Clase 8 cubre aprendizaje sobre streams de datos: ingesta continua vía Kafka / Pub-Sub, motores de procesamiento como Flink (sub-milisegundo) o Spark Streaming (segundos), continual learning con algoritmos single-pass (Hoeffding Trees, FTRL-Proximal, SGD incremental) y frameworks como Vowpal Wabbit o River ML. Este proyecto **no** implementa ninguno de esos componentes a esa cadencia, y la decisión es estructural sobre el dominio.
+
+#### Por qué no aplica streaming a sub-segundo / sub-milisegundo
+
+Streaming asume tres condiciones que justifican el costo de la infraestructura asociada:
+
+1. **Ingesta continua de eventos**: clicks, transacciones, mensajes, sensores. Decenas o miles de eventos por segundo.
+2. **Costo de oportunidad por latencia**: la decisión de negocio pierde valor si tarda segundos (ads/recomendaciones, fraude, dynamic pricing — slide 7 de la clase).
+3. **Cadencia rápida del mundo real**: el fenómeno modelado cambia a la velocidad de los eventos.
+
+Ninguna se cumple acá:
+
+1. **Los datos vienen mensualmente** del Ministerio de Energía como dataset estructurado del régimen regulatorio. No hay un stream de eventos por segundo — hay 12 actualizaciones del dataset por año.
+2. **El consumidor de la API es un analista de producción o un dashboard de planificación**, no un loop de control que decide en milisegundos. La latencia tolerable es de segundos (ver SLA en Decisión #10), no de microsegundos.
+3. **La producción de un pozo cambia a escala de meses**, no de segundos. Un decline rate típico se mide en porcentaje mensual, y las decisiones operativas (workover, intervención, abandono) se toman en horizontes de semanas a meses.
+
+#### Por qué tampoco aplica continual learning sub-mensual
+
+Continual learning *sub-mensual* (actualizar el modelo cada hora / día / minuto a partir de eventos individuales) tiene los mismos prerrequisitos que streaming, más uno propio: **la dinámica del fenómeno tiene que cambiar lo suficientemente rápido como para que valga la pena reentrenar entre ciclos batch**. En oil & gas no es así: los reportes regulatorios son mensuales, las features de ventana (`avg_prod_*_10m`) usan ventanas de 10 meses, el target es producción mensual. Reentrenar más seguido no agrega información — los datos no llegan más rápido que el ciclo del DAG.
+
+#### Lo que sí está implementado del concepto: continual learning a cadencia mensual
+
+Conviene aclarar que **el proyecto sí implementa continual learning, pero a la cadencia natural del dominio (mensual)**, no en streaming. La Decisión #13 (XGBoost incremental por chunks mensuales) implementa exactamente la idea de "actualizar el modelo con cada chunk nuevo de datos sin recargar el histórico completo en memoria" — el chunk es un mes en lugar de un evento. Esa decisión cubre el principio de la clase 8 (memoria acotada, single-pass por chunk) ajustado a la cadencia del problema.
+
+#### Trade-offs frente a streaming real
+
+| Aspecto | Streaming real (no implementado) | Mensual con XGBoost incremental (elegido) |
+|---|---|---|
+| Latencia de actualización del modelo | Segundos a minutos | Un mes (cuando corre el DAG) |
+| Frescura de features | Sub-segundo (Redis + OLAP) | Mensual (Feast online store, SQLite) |
+| Infra requerida | Kafka + Flink + Redis + OLAP DB + cluster 24/7 | Airflow + MLflow + Feast + Ray Serve |
+| Costo operativo (OpEx) | Alto sostenido (slide 49 de la clase) | Bajo, escala con triggers del DAG |
+| Justificación de negocio | Necesaria si la latencia importa para la decisión | No necesaria — el horizonte es mensual |
+
+La slide 50 de la clase plantea exactamente este trade-off: "si un modelo XGBoost estático alcanza 86 % y la variante en streaming logra 88 %, el impacto de negocio de ese +2 % debe justificar el aumento de infraestructura". En este caso, ese +2 % no compensa el orden de magnitud de complejidad operativa que sumaría streaming. La conclusión coincide con la slide 51 de la clase: continual learning aplica para "motores publicitarios, pricing dinámico, mercados financieros, ciberseguridad" — no para predicción de producción regulatoria con cadencia mensual.
 
 ---
 

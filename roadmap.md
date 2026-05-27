@@ -11,16 +11,9 @@
 | ✅ Mergeado | #24 Cierre de #12 (CSV hash) | 2026-04-30 | Supuesto de inmutabilidad aceptado |
 | ✅ Mergeado | #29 Ray Serve (cubre #6 obligatorio) | 2026-04-30 | `num_replicas=2` unificado |
 | ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
-| 🔄 En curso | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-04-30 | Rama `feature/model-decay-monitor` |
-| ⏳ Pendiente | Incremental learning (#36) | - | Migrar RandomForest → XGBoost con training en chunks. Resuelve OOM en training y habilita entrenar con histórico completo. |
-| ⏳ Pendiente | #18 Segundo dataset del RFC | - | Información complementaria, no obligatorio |
-| ⏳ Pendiente | #9 + #10 Quick wins (eval desagregada + feature importance) | - | Mismo PR, toca `evaluate_model` |
-| ⏳ Pendiente | #16 CI/CD básico | - | GitHub Actions con tests + lint |
-| ⏳ Pendiente | #11 OpenAPI descriptions | - | Solo `main.py` |
-| ⏳ Pendiente | #13 LabelEncoder como artefacto | - | Persistir como pickle en MLFlow |
-| ⏳ Pendiente | #14 Validación de schema | - | `pandera` en `download_dataset` |
-| ⏳ Pendiente | #15 Prediction logging | - | CSV/SQLite en `main.py` |
-| ⏳ Pendiente | #17 Point-in-Time correct | - | Más complejo, solo si hay tiempo |
+| ✅ Mergeado | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-05-01 | Mergeado en PR #35. Cubre obligatorio del RFC con R² delta + drift_share via PSI |
+| 🔄 En review | Incremental learning XGBoost (#36) | 2026-05-07 | PR #37 abierto. Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
+**Pendientes consolidados en el [Backlog priorizado](#backlog-priorizado) más abajo** — incluye los issues del roadmap original (#9, #10, #11, #13, #14, #15, #16, #17, #18) y los detectados durante reviews de las clases 6, 7 y 8 (#26, #27, #28, #38, #39, #40-44, #46-48).
 
 **Notas sobre la evolución del scope:**
 
@@ -30,12 +23,51 @@
 
 ---
 
+## Backlog priorizado
+
+Issues abiertos ordenados por importancia. Los dos obligatorios del RFC ya están cerrados (#29 Ray Serve + #31 Evidently), por lo que esta priorización refleja **valor incremental** sobre el sistema, no urgencia para la entrega.
+
+Criterio de los niveles:
+
+- **P1 — Operativos críticos**: previenen fallos silenciosos y endurecen el sistema. Bajo esfuerzo, alto impacto preventivo.
+- **P2 — Observabilidad y monitoreo**: dan visibilidad sobre qué pasa en producción y completan el monitoreo iniciado en #31.
+- **P3 — Calidad del pipeline**: cierran gaps de best practices identificados en el README y reviews.
+- **P4 — Robustez estructural**: cambios más invasivos pero importantes para escala (memoria, CI/CD, point-in-time).
+- **P5 — Optimizaciones data-driven**: requieren datos previos (latencia medida, asimetría observada) para justificarse — abrir solo cuando haya evidencia.
+
+| Prioridad | Issue | Notas |
+|---|---|---|
+| **P1** | [#46](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/46) Alerta de modelo stale | Detecta DAG fallando silenciosamente. Endpoint `/health/staleness` o tarea Airflow independiente. Origen: Clase 7, Caso 1 YarnIt. |
+| **P1** | [#47](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/47) Validación de outputs (NaN / rangos físicos) | Defensivo. Evita devolver predicciones absurdas (negativas, NaN) al consumidor. Origen: Clase 7, slide 62. |
+| **P1** | [#14](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/14) Validación de schema CSV con pandera | Detecta cambios upstream en el dataset MINEM antes de romper en una tarea posterior. Origen: roadmap original. |
+| **P1** | [#42](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/42) Health check + graceful degradation | Endpoints `/health/live` y `/health/ready` + fallback al modelo cacheado en disco. Origen: Clase 6, slides 36 y 52. |
+| **P1** | [#41](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/41) Autenticación API key | Hoy `/api/v1/*` están abiertos. Mínimo: `X-API-Key` validado contra `.env`. Origen: Clase 6, slide 52. |
+| **P2** | [#40](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/40) Métricas de latencia P50/P90/P99 | Prerrequisito para definir SLA y para validar #27/#28. Origen: Clase 6, slides 7, 27, 52. |
+| **P2** | [#44](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/44) Logs operacionales estructurados (JSON) | Distinto de #15: logs de sistema, no de predicciones. Base para debugging serio. Origen: Clase 6, slide 51. |
+| **P2** | [#15](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/15) Prediction logging en API | CSV/SQLite con `(id_well, date, target, pred, features, timestamp)`. Habilita análisis de drift en producción. Origen: roadmap original. |
+| **P2** | [#48](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/48) Bias y calibration en `monitor_model` | Completa la tríada de canary metrics. Hoy hay R² delta + drift_share, faltan bias y calibración por bucket. Origen: Clase 7, slide 11. |
+| **P2** | [#43](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/43) Prometheus + Grafana | Stack estándar para observabilidad operativa. Depende de #40 (necesita endpoint `/metrics`). Origen: Clase 6, slide 51. |
+| **P3** | [#9](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/9) Eval desagregada por `tipoextraccion` | Quick win en `evaluate_model`. Detecta disparate impact por subgrupo. Origen: roadmap original (ética IA). |
+| **P3** | [#10](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/10) Feature importance en MLFlow | Quick win, mismo PR que #9. Una línea por feature por target. Origen: roadmap original (XAI). |
+| **P3** | [#13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13) LabelEncoder como artefacto | Cierra training-serving skew latente si aparecen nuevas categorías de `tipoextraccion`. Origen: roadmap original. |
+| **P3** | [#11](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/11) OpenAPI descriptions en endpoints | Mejora usabilidad del Swagger UI con descriptions y ejemplos por param. Origen: roadmap original. |
+| **P4** | [#38](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/38) Refactor `split_data` y `prepare_offline_store` por chunks | El siguiente bottleneck post-XGBoost — Feast cargando todo en RAM. Habilita entrenar con 3+ años. Origen: bitácora #36. |
+| **P4** | [#16](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/16) CI/CD básico con GitHub Actions | Tests + lint + validación de schema en cada PR. Lleva al Nivel 2 de MLOps. Origen: roadmap original. |
+| **P4** | [#17](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/17) Point-in-Time correct con `entity_df` en Feast | Robustez del entrenamiento ante mutaciones retroactivas del dataset upstream. Origen: roadmap original. |
+| **P4** | [#18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18) Segundo dataset del RFC | Metadata estructural por pozo (formación, cuenca, empresa). Complementa el modelo. Origen: roadmap original. |
+| **P5** | [#27](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/27) Cache de inferencia con Redis | Optimización condicional. Justificada solo si #40 muestra que la CPU del API es bottleneck. Origen: Clase 6. |
+| **P5** | [#28](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/28) Autoscaling dinámico de Ray Serve | Optimización condicional. Justificada solo si #40 muestra utilización desigual. Origen: Clase 6. |
+| **P5** | [#26](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/26) Separación de deployments gas/pet | Justificada solo si #15 muestra asimetría sostenida de carga entre fluidos. Origen: Clase 6 / Decisión #10 README. |
+| **P5** | [#39](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/39) Adaptive Isolation Forest | Exploratorio para `monitor_model`. No aplica directamente al caso de uso (no es clasificación de fraude). Origen: Clase 7. |
+
+---
+
 ## Requerimientos obligatorios pendientes
 
-Tras releer el RFC, los obligatorios (DEBE) están todos en marcha o cerrados:
+Tras releer el RFC, los dos obligatorios (DEBE) están cerrados:
 
 - ✅ **Arquitectura escalable de inferencia (Ray):** cubierto por #29 (Ray Serve) — mergeado.
-- 🔄 **Reporte de model decay / data drift con al menos dos métricas:** en curso en #31 (Evidently AI).
+- ✅ **Reporte de model decay / data drift con al menos dos métricas:** cubierto por #31 (Evidently AI) — mergeado en PR #35 (2026-05-01).
 
 ---
 
@@ -43,9 +75,9 @@ Tras releer el RFC, los obligatorios (DEBE) están todos en marcha o cerrados:
 
 **Requisito:** El sistema DEBE dar un reporte de model decay, data drift / concept drift con al menos dos métricas que permitan observar cuándo la performance del modelo se aleja de la esperada.
 
-**Estado:** ❌ No implementado.
+**Estado:** ✅ Implementado en #31 (mergeado en PR #35, 2026-05-01). Ver bitácora más abajo para el detalle de decisiones e iteraciones. La sección a continuación es la propuesta original de diseño que guió la implementación.
 
-**Propuesta de implementación:**
+**Propuesta de implementación original:**
 
 Agregar una tarea `monitor_model` al final del DAG (después de `select_best_model`) que compare el modelo recién entrenado contra la versión anterior en producción y genere un reporte con estas métricas:
 
@@ -79,9 +111,9 @@ La ponderación refleja prioridades del problema: R² es el indicador principal 
 
 **Requisito:** El sistema DEBE implementar una arquitectura escalable para responder la inferencia de la API (ej: Ray).
 
-**Estado:** ❌ No implementado. La API actual corre con un único proceso uvicorn dentro del contenedor Airflow.
+**Estado:** ✅ Implementado en #29 (mergeado 2026-04-30) con Ray Serve + FastAPI, `num_replicas=2` unificado. Ver Decisión #10 del README para el detalle arquitectónico. La sección a continuación es la propuesta original que guió la implementación.
 
-**Propuesta de implementación:**
+**Propuesta de implementación original:**
 
 Reemplazar el servidor uvicorn simple por Ray Serve:
 
@@ -265,11 +297,11 @@ Reemplaza el filtro manual por un param `exclude_years=[2020]` por default. **De
 
 ---
 
-### En desarrollo — #31 Reporte de model decay con Evidently AI
+### #31 — Reporte de model decay con Evidently AI (mergeado 2026-05-01)
 
 **Rama:** `feature/model-decay-monitor`
 **Inicio:** 2026-04-30
-**Estado:** En desarrollo, validación en curso del DAG end-to-end.
+**Estado:** ✅ Mergeado en PR #35 (2026-05-01). Cierra obligatorio del RFC.
 **Cubre obligatorio del RFC:** "El sistema DEBE dar un reporte de model decay / data drift con al menos dos métricas que permitan observar cuándo la performance del modelo se aleja de la esperada."
 **Consolida issues:** #7 (model decay report), #8 (threshold configurable), motivación de #30 (alibi-detect, cerrado).
 
@@ -423,12 +455,111 @@ PSI es el threshold estándar de la industria (PSI < 0.1 sin drift, 0.1-0.25 mod
 
 **Lección general:** para data drift en pipelines automáticos donde el tamaño de muestra varía de un run a otro, **preferir métricas de magnitud sobre tests de hipótesis**. Los p-values son útiles para decisiones puntuales con muestras chicas; las métricas de magnitud son más robustas en producción.
 
-#### Próximos pasos para cerrar #31
+#### Cómo se cerró #31
 
-1. Validar la corrida end-to-end después del fix de Evidently 0.6.7.
-2. Verificar artefactos: HTML del reporte en MLFlow + métricas `monitor_r2`, `monitor_drift_share`, `monitor_r2_delta`.
-3. Commitear y abrir PR con CODEOWNERS auto-asignando review.
-4. Reiniciar `api-1` después del DAG para volver al setup completo.
+1. ✅ Validada la corrida end-to-end después del fix de Evidently 0.6.7.
+2. ✅ Verificados artefactos: HTML del reporte en MLFlow + métricas `monitor_r2`, `monitor_drift_share`, `monitor_r2_delta`.
+3. ✅ PR abierto, revisado y mergeado como PR #35.
+4. ✅ Setup completo restaurado tras el DAG run.
+
+---
+
+### 🔄 En review — #36 Incremental learning con XGBoost
+
+**Rama:** `feature/incremental-learning-xgboost`
+**Inicio:** 2026-05-02
+**Estado:** validación end-to-end completa ✅, PR #37 abierto y en review.
+**Resuelve:** OOM estructural de `RandomForestRegressor.fit()` al entrenar con histórico extenso.
+
+#### Cambio conceptual
+
+Random Forest es un *bagging ensemble*: cada árbol se entrena sobre un bootstrap sample del dataset completo. La limitación de memoria es **algorítmica, no de implementación**: necesita acceso simultáneo a todo el dataset al armar cada árbol y por eso no tiene `partial_fit`. Con eso, entrenar localmente con histórico extenso (~2019 en adelante) era inviable.
+
+XGBoost es un *gradient boosting ensemble* construido secuencialmente: cada árbol nuevo aprende del error residual del modelo anterior. Esa propiedad permite *continuation*: cargar un modelo previo y agregarle árboles nuevos entrenando solo con un chunk de datos. La memoria queda acotada por el tamaño del chunk + el booster (chico, < 10 MB), no por el dataset total.
+
+**Aclaración:** la mejora no viene de cambiar el modelo solo. XGBoost con `xgb.fit(dataset_completo)` reproduce el mismo OOM. Son **dos cambios juntos**: (1) algoritmo que soporte continuación, y (2) bucle que itere el dataset por chunks.
+
+#### Decisiones tomadas durante la implementación
+
+1. **XGBoost sobre SGDRegressor.** SGDRegressor mantiene memoria estrictamente constante via `partial_fit`, pero es lineal — pierde la capacidad no-lineal valiosa para los features de ventana (`avg_prod_*_10m`, `last_prod_*`) y estáticos (`profundidad`). El tradeoff de memoria estrictamente constante no compensa la pérdida predictiva.
+2. **Chunks mensuales en orden temporal.** El split de Feast ya provee `event_timestamp`; iterar por mes es natural. El orden cronológico es deliberado: los meses recientes pesan más en el modelo final, lo cual es coherente con el caso de uso (predecir el mes siguiente).
+3. **`n_estimators_per_chunk` en lugar de `n_estimators`.** En XGBoost continuation, el parámetro pasa a ser "árboles a agregar por chunk", no "total". Con dataset de ~10 meses de train, `n_estimators_per_chunk=10` produce ~100 árboles totales. Renombrar el parámetro evita confusión.
+4. **`learning_rate=0.1`** (default de XGB es 0.3). Más conservador para que ningún chunk individual domine al modelo final.
+5. **Formato `.ubj` en MLFlow** (no pickle). `mlflow.xgboost.log_model(model_format="ubj")` preserva metadata específica de XGBoost y es portable entre versiones.
+6. **`event_timestamp` en X_train/X_test.** Para que `train_model` pueda iterar por mes. En las tasks que entrenan/predicen se filtra a `[features]` antes de pasar al modelo, así que nunca llega como feature.
+7. **`LabelEncoder` se mantiene** para `tipoextraccion`. XGBoost lo trata como ordinal numérico (subóptimo pero funciona). Migrar a `enable_categorical=True` queda para [issue #13](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/13).
+
+#### Validación end-to-end (run `manual__2026-05-07T22:22:24`)
+
+- **DAG completó exitosamente** las 27 tareas (download, prepare, online_store, split, 10 × train+evaluate, select_best_model, monitor_model). 0 fallos.
+- **Training:** ejemplo del primer experimento (prod_pet, 5 árboles/chunk): 31.940 samples procesados en **9 chunks mensuales**, 45 árboles totales en el modelo final.
+- **Memoria:** training en chunks no provocó picos de RAM perceptibles, a diferencia del RF que generaba presión cerca del límite.
+
+#### Validación cuantitativa con 3 escenarios de rango temporal
+
+Después de la validación end-to-end inicial, se diseñó un experimento más riguroso para cuantificar el tradeoff RF vs XGBoost. La idea: correr el DAG con tres rangos temporales crecientes (A: 2 años, B: 3 años, C: 4 años efectivos) en ambos modelos y medir tiempo, RAM y performance.
+
+**Tabla 1 — Resumen ejecutivo**
+
+| Escenario | Modelo | Estado | Tiempo total | Tiempo train_model (suma 10 exp) | RAM peak worker |
+|---|---|---|---|---|---|
+| A (2022-2023) | XGBoost | ✅ success | **244s** | **45s** | **2.99 GiB** |
+| A (2022-2023) | RandomForest | ✅ success | 469s | 211s | 3.53 GiB |
+| B (2020-2023) | XGBoost | ❌ failed en `split_data` | 98s | (no llegó) | 3.67 GiB |
+| B (2020-2023) | RandomForest | (saltado, fallaría idéntico) | — | — | — |
+| C (2019-2023) | XGBoost | (saltado, fallaría idéntico) | — | — | — |
+| C (2019-2023) | RandomForest | (saltado, fallaría idéntico) | — | — | — |
+
+**Tabla 2 — Setup**
+
+| Escenario | Modelo | Filas X_train | Árboles totales | Hiperparámetros clave |
+|---|---|---|---|---|
+| A | XGBoost | 63.424 | 95 (5 × 19 chunks) | est_pc=5, depth=6, lr=0.1 |
+| A | RandomForest | 63.424 | 100 | est=100, depth=10 |
+
+**Tabla 3 — Performance (escenario A, único comparable)**
+
+| Modelo | R² gas | R² pet | RMSE gas (m³) | RMSE pet (m³) | MAE gas (m³) | MAE pet (m³) |
+|---|---|---|---|---|---|---|
+| XGBoost | 0.871 | 0.863 | 668,9 | 393,8 | 193,3 | 122,4 |
+| RandomForest | **0.923** | **0.902** | **517,4** | **334,4** | **141,7** | **93,7** |
+| Δ (RF − XGB) | +5,2 pp | +3,9 pp | −151,5 (−23%) | −59,4 (−15%) | −51,6 (−27%) | −28,7 (−24%) |
+
+**Lectura del experimento:**
+
+- **XGBoost gana en eficiencia operativa**: ~2× más rápido total, ~5× más rápido específicamente en `train_model`, 15% menos RAM peak. En producción mensual estos ahorros son reales.
+- **RandomForest gana en precisión** en este rango chico: R² entre 4 y 5 pp mejor, RMSE 15-23% menor.
+- **B y C revelan el siguiente cuello de botella**: con 3+ años, ambos modelos fallan en `split_data` por OOM. La razón no es el modelo: es Feast cargando todo en memoria al hacer `get_historical_features`, antes incluso de empezar a entrenar.
+
+#### Tuning fallido — la config conservadora era el techo
+
+Tras ver la pérdida de performance, se intentó tunear XGBoost con configuraciones más agresivas (max_depth=8-10, learning_rate=0.1-0.2, est_pc=10-15) bajo la hipótesis de que la config original era subóptima por árboles muy chicos y learning_rate muy bajo.
+
+**Resultado: todos los experimentos empeoraron.**
+
+| Configuración | R² gas | R² pet | Diagnóstico |
+|---|---|---|---|
+| depth=6, lr=0.1, est_pc=5 (original) | 0.871 | 0.863 | Baseline. |
+| depth=10, lr=0.1, est_pc=10 | 0.661 | 0.673 | −0,21 pp |
+| depth=10, lr=0.2, est_pc=10 | −0.04 | −0.24 | Catastrófico. |
+| depth=8, lr=0.1, est_pc=15 | 0.458 | 0.484 | −0,41 pp |
+| depth=8, lr=0.2, est_pc=10 | −0.08 | 0.217 | Catastrófico. |
+| depth=10, lr=0.1, reduced features | −0.46 | −0.07 | Catastrófico. |
+
+**Diagnóstico — overfitting estructural por incremental + árboles profundos:**
+
+Con `max_depth=10` cada árbol es muy expresivo. Con 19 chunks × 10 árboles = 190 árboles muy expresivos acumulados. Cada chunk se ajusta al residuo de su mes específico y memoriza patrones locales. El test set es contiguous a los meses finales del train (split temporal 80/20 sobre fechas), entonces los chunks finales overfittean justo donde se va a evaluar. `learning_rate=0.2` acelera el efecto.
+
+**Aprendizaje: la pérdida de R² ~5 pp vs RandomForest no es por subóptima configuración — es el costo intrínseco del incremental learning con árboles en este dataset.** Subir capacidad expresiva (depth) o agresividad (lr) empeora porque ya estábamos en el sweet spot.
+
+Se vuelve a la configuración original (depth=6, lr=0.1, est_pc=5) y se acepta el tradeoff documentado.
+
+#### Lo que NO resuelve esta feature (próximos cuellos de botella)
+
+1. **`split_data` y `prepare_offline_store` siguen cargando todo en memoria.** Los escenarios B y C fallaron acá, antes del training. **Es el siguiente bottleneck prioritario** — issue separado a abrir: refactorear estas tareas a procesamiento por chunks o migrar de pandas in-memory a Dask/Polars. **Resolver esto desbloquea dos mejoras independientes que pueden compensar la pérdida de performance:**
+   - Entrenar con histórico completo (B/C escenarios). XGBoost con más datos típicamente mejora; el escalado a 4+ años puede acercar la performance a RF e incluso superarla en datos más recientes.
+   - Sumar el segundo dataset del RFC ([#18](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/18)) con metadata estructural por pozo (formación geológica, cuenca, empresa). Esos features tienen capacidad explicativa que hoy no está en el modelo y podrían cerrar la brecha vs RandomForest.
+2. **Presión de RAM por containers simultáneos.** Sigue siendo necesario parar `api-1` durante el DAG run o subir RAM de Docker Desktop.
 
 ---
 

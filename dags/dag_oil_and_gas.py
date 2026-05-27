@@ -4,7 +4,6 @@ from airflow.models.param import Param
 from sklearn.preprocessing import LabelEncoder
 import pandas as pd # Lo usamos en varias tasks asi que tiene sentido importarlo fuera del dag
 import os # Lo usamos en varias tasks asi que tiene sentido importarlo fuera del dag
-import pickle # Lo usamos en varias tasks asi que tiene sentido importarlo fuera del dag
 
 # -------------------- EXPERIMENTOS --------------------
 
@@ -15,22 +14,34 @@ ALL_FEATURES_GAS = ['tipoextraccion', 'tef', 'profundidad', 'prod_agua', 'avg_pr
 REDUCED_FEATURES_GAS = ['tipoextraccion', 'tef', 'profundidad']
 
 EXPERIMENTS = [
-    # prod_pet: variando n_estimators
-    {'target': 'prod_pet', 'model_params': {'n_estimators': 50, 'random_state': 42}, 'features': ALL_FEATURES_PET},
-    {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': ALL_FEATURES_PET},
-    # prod_pet: limitando profundidad del árbol
-    {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 5}, 'features': ALL_FEATURES_PET},
-    {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 10}, 'features': ALL_FEATURES_PET},
-    # prod_pet: features reducidas
-    {'target': 'prod_pet', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': REDUCED_FEATURES_PET},
-    # prod_gas: variando n_estimators
-    {'target': 'prod_gas', 'model_params': {'n_estimators': 50, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
-    {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
-    # prod_gas: limitando profundidad
-    {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 5}, 'features': ALL_FEATURES_GAS},
-    {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42, 'max_depth': 10}, 'features': ALL_FEATURES_GAS},
+    # XGBoost incremental: n_estimators_per_chunk = árboles agregados por mes (chunk).
+    # Total de árboles del modelo final = n_estimators_per_chunk * cantidad de meses en train.
+    # Ej: con dataset de ~10 meses de train, n_estimators_per_chunk=10 → ~100 árboles totales.
+    # learning_rate=0.1 (más conservador que el default 0.3, ningún chunk individual domina).
+    #
+    # Grilla validada experimentalmente: configuraciones más agresivas (max_depth=10,
+    # learning_rate=0.2) generan overfitting estructural por la combinación incremental
+    # + árboles profundos (cada chunk se ajusta al residuo local y memoriza patrones del
+    # mes; con muchos chunks se sobreajusta justo a los meses contiguos al test set).
+    # Detalle en la bitácora: "Tuning fallido — la config conservadora era el techo".
+
+    # prod_pet: variando n_estimators_per_chunk
+    {'target': 'prod_pet', 'model_params': {'n_estimators_per_chunk': 5,  'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_PET},
+    {'target': 'prod_pet', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_PET},
+    # prod_pet: variando max_depth
+    {'target': 'prod_pet', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 4, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_PET},
+    {'target': 'prod_pet', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 8, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_PET},
+    # prod_pet: features reducidas (baseline de ablación)
+    {'target': 'prod_pet', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': REDUCED_FEATURES_PET},
+
+    # prod_gas: variando n_estimators_per_chunk
+    {'target': 'prod_gas', 'model_params': {'n_estimators_per_chunk': 5,  'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
+    {'target': 'prod_gas', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
+    # prod_gas: variando max_depth
+    {'target': 'prod_gas', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 4, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
+    {'target': 'prod_gas', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 8, 'learning_rate': 0.1, 'random_state': 42}, 'features': ALL_FEATURES_GAS},
     # prod_gas: features reducidas
-    {'target': 'prod_gas', 'model_params': {'n_estimators': 100, 'random_state': 42}, 'features': REDUCED_FEATURES_GAS},
+    {'target': 'prod_gas', 'model_params': {'n_estimators_per_chunk': 10, 'max_depth': 6, 'learning_rate': 0.1, 'random_state': 42}, 'features': REDUCED_FEATURES_GAS},
 ]
 
 # -------------------- DAG --------------------
@@ -255,8 +266,12 @@ def ml_pipeline():
     train_df = training_df[training_df['event_timestamp'] <  cutoff_date]
     test_df  = training_df[training_df['event_timestamp'] >= cutoff_date]
 
-    # X es igual para ambos targets: mismas filas, mismas columnas (sin ID, timestamp ni targets)
-    non_features = ['idpozo', 'event_timestamp', 'prod_pet', 'prod_gas']
+    # X es igual para ambos targets: mismas filas, mismas columnas.
+    # IMPORTANTE: mantenemos event_timestamp en X para que train_model pueda iterar por mes
+    # (chunks mensuales para incremental learning con XGBoost). En train_model y evaluate_model
+    # se filtra X a `[features]` antes de pasarlo al modelo, así que event_timestamp queda
+    # disponible para particionar el dataset pero nunca llega como feature al modelo.
+    non_features = ['idpozo', 'prod_pet', 'prod_gas']
     X_train = train_df.drop(columns = non_features)
     X_test  = test_df.drop(columns = non_features)
 
@@ -288,132 +303,186 @@ def ml_pipeline():
   @task
   def train_model(splits, config):
       """
-      Entrena un RandomForestRegressor según la configuración del experimento,
-      guarda el modelo en disco y retorna metadata para que evaluate_model lo evalúe.
+      Entrena un XGBRegressor en chunks mensuales (incremental learning) según la
+      configuración del experimento, guarda el booster final en disco y retorna metadata.
 
-      Args: splits (dict) - diccionario con paths a cada uno de los subconjuntos de train y test,
-            config (dict) - configuración del experimento con target, features y model_params.
-      Retorna: dict con metadata del modelo (target, features, ruta, n_samples, model_params).
+      A diferencia de RandomForest, donde cada `fit` requiere todo el dataset en RAM,
+      XGBoost permite continuar el entrenamiento sobre un modelo previo: cada chunk
+      agrega árboles nuevos al final del booster sin tocar los anteriores. Esto acota
+      el uso de memoria a `chunk_actual + booster_creciente` (~MB) en lugar de
+      `dataset_completo + modelo` (~GB con histórico extenso).
+
+      Iteración por mes en orden temporal: el split de Feast ya viene con
+      `event_timestamp`. Se agrupa por `(año, mes)` y se hace `XGBRegressor.fit`
+      sobre cada chunk pasando `xgb_model=booster_path` para continuar el modelo
+      previo. El orden temporal es deliberado: los meses recientes pesan más en el
+      modelo final, lo cual es coherente con el caso de uso de inferencia
+      (predecir el mes siguiente).
+
+      Args: splits (dict) - paths a los subconjuntos train/test (output de split_data).
+            config (dict) - configuración del experimento. `model_params` debe incluir
+            `n_estimators_per_chunk` (árboles a agregar por mes), `max_depth`,
+            `learning_rate`, `random_state`.
+      Retorna: dict con metadata del modelo (target, features, model_path, n_samples,
+            n_chunks, model_params con n_estimators_total calculado).
       """
-      from sklearn.ensemble import RandomForestRegressor
+      import xgboost as xgb
 
       # Extraemos la configuración del experimento
       target = config['target']
       features = config['features']
-      model_params = config['model_params']
+      base_params = config['model_params']
+      n_estimators_per_chunk = base_params['n_estimators_per_chunk']
 
-      # Construimos el path del modelo en base al target y los hiperparámetros
-      model_path = f'/opt/airflow/models/model_{target}_est{model_params["n_estimators"]}_depth{model_params.get("max_depth", "none")}.pkl'
+      # Convertimos a hiperparámetros aceptados por XGBRegressor
+      # (sacamos n_estimators_per_chunk y agregamos n_estimators con su valor)
+      xgb_params = {k: v for k, v in base_params.items() if k != 'n_estimators_per_chunk'}
+      xgb_params['n_estimators'] = n_estimators_per_chunk
 
-      # Leemos los subconjuntos de train filtrando solo las features del experimento
-      X_train = pd.read_parquet(splits.get(target).get('X_train'))[features]
-      y_train = pd.read_parquet(splits.get(target).get('y_train')).squeeze()
-
-      # Creamos el modelo con los hiperparámetros del experimento
-      # Random Forest construye N árboles de decisión, cada uno entrenado con una muestra aleatoria distinta de los datos y un subconjunto aleatorio de features
-      # Para predecir, promedia los resultados de todos los árboles
-      model = RandomForestRegressor(**model_params)
-
-      # Lo entrenamos
-      model.fit(X_train, y_train)
-
-      # Creamos la carpeta si no existe (pickle falla si la carpeta no existe)
+      # Path del modelo en formato .ubj (nativo de XGBoost — más portable que pickle entre versiones)
+      model_path = f'/opt/airflow/models/model_{target}_est{n_estimators_per_chunk}_depth{xgb_params.get("max_depth", "default")}_feat{"all" if len(features) > 3 else "reduced"}.ubj'
       os.makedirs(os.path.dirname(model_path), exist_ok = True)
 
-      # Guardamos el modelo en disco en formato binario
-      # Lo que guardamos es el objeto modelo completo: todos los árboles con sus reglas de split
-      with open(model_path, 'wb') as f:
-          pickle.dump(model, f)
+      # Leemos X_train completo (con event_timestamp) y y_train
+      X_train = pd.read_parquet(splits.get(target).get('X_train'))
+      y_train = pd.read_parquet(splits.get(target).get('y_train')).squeeze()
 
+      # Aseguramos que event_timestamp es datetime para poder agrupar por mes
+      X_train['event_timestamp'] = pd.to_datetime(X_train['event_timestamp'])
+
+      # Iteramos por mes en orden temporal (sort=True por default en groupby)
+      booster_path = None
+      n_chunks = 0
+      n_samples_total = 0
+
+      for periodo, X_chunk in X_train.groupby(X_train['event_timestamp'].dt.to_period('M')):
+          # Aislamos las features que el modelo usa (event_timestamp, idpozo, etc. no entran)
+          X_chunk_features = X_chunk[features]
+          y_chunk = y_train.loc[X_chunk.index]
+
+          # Creamos un nuevo XGBRegressor por chunk con los mismos hiperparámetros estructurales.
+          # Pasar xgb_model=booster_path le dice a XGBoost que continúe el modelo previo
+          # (sin xgb_model, .fit() reentrena desde cero silenciosamente — pitfall conocido).
+          model = xgb.XGBRegressor(**xgb_params)
+          if booster_path is not None:
+              model.fit(X_chunk_features, y_chunk, xgb_model = booster_path)
+          else:
+              model.fit(X_chunk_features, y_chunk)
+
+          # Guardamos el booster en formato nativo .ubj (sobreescribe la versión anterior)
+          model.save_model(model_path)
+          booster_path = model_path
+          n_chunks += 1
+          n_samples_total += len(X_chunk)
+
+      # Devolvemos metadata. n_estimators_total refleja la cantidad real de árboles
+      # del modelo final (cada chunk agregó n_estimators_per_chunk árboles).
       return {
           'target': target,
           'features': features,
           'model_path': model_path,
-          'n_samples': len(X_train),
-          'model_params': model_params
+          'n_samples': n_samples_total,
+          'n_chunks': n_chunks,
+          'model_params': {
+              **xgb_params,
+              'n_estimators_per_chunk': n_estimators_per_chunk,
+              'n_estimators_total': n_estimators_per_chunk * n_chunks,
+          }
       }
   
   @task
   def evaluate_model(results, splits):
     """
-    Carga el modelo entrenado, evalúa sus métricas sobre el conjunto de test,
-    las loguea en MLflow y registra el modelo con un nombre para poder cargarlo desde la API.
+    Carga el modelo XGBoost entrenado en chunks, evalúa sus métricas sobre el conjunto
+    de test, las loguea en MLflow y registra el modelo en el Model Registry para que
+    la API pueda cargarlo en inferencia.
 
-    Args: results (dict) - metadata del modelo incluyendo target, features y model_path,
-          splits (dict) - diccionario con paths a cada uno de los subconjuntos de train y test.
-    Retorna: None.
+    Args: results (dict) - metadata del modelo incluyendo target, features y model_path
+          (booster en formato .ubj generado por train_model).
+          splits (dict) - paths a los subconjuntos train/test.
+    Retorna: dict con target y run_id (consumido por select_best_model).
     """
-    # Importamos métricas de Sickit Learn
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-    # Importamos MLFlow
+    import xgboost as xgb
     import mlflow
-    import mlflow.sklearn
+    import mlflow.xgboost
     from mlflow.tracking import MlflowClient
 
-    # Definimos las variables que fueron seleccionadas para entrenar (tienen que ser las mismas para no romper)
     features = results['features']
 
-    # Leemos los subconjuntos de train y test
+    # Leemos test set filtrado a las features del experimento (X_test puede traer
+    # event_timestamp por el cambio en split_data, así que lo filtramos explícitamente)
     X_test = pd.read_parquet(splits.get(results['target']).get('X_test'))[features]
     y_test = pd.read_parquet(splits.get(results['target']).get('y_test')).squeeze()
 
-    # Cargamos el modelo
-    loaded_model = pickle.load(open(results['model_path'], 'rb'))
+    # Cargamos el booster desde el path .ubj que generó train_model
+    loaded_model = xgb.XGBRegressor()
+    loaded_model.load_model(results['model_path'])
     y_pred = loaded_model.predict(X_test)
 
-    # Calculamos métricas en testing
+    # Métricas en testing
     mae = mean_absolute_error(y_test, y_pred)
     mse = mean_squared_error(y_test, y_pred)
     rmse = mse ** 0.5
     r2 = r2_score(y_test, y_pred)
 
     # Nombre descriptivo del run para identificarlo en la UI de MLflow
-    # Ej: "prod_gas_est100_depth5_featall"
-    run_name = f"{results['target']}_est{results['model_params']['n_estimators']}_depth{results['model_params'].get('max_depth', 'none')}_feat{'all' if len(results['features']) > 2 else 'reduced'}"
+    # Ej: "prod_gas_est10pc_depth6_featall" — pc = per chunk
+    n_estimators_pc = results['model_params']['n_estimators_per_chunk']
+    n_estimators_total = results['model_params']['n_estimators_total']
+    depth_label = str(results['model_params'].get('max_depth', 'default'))
+    feat_label = 'all' if len(results['features']) > 3 else 'reduced'
+    run_name = f"{results['target']}_est{n_estimators_pc}pc_depth{depth_label}_feat{feat_label}"
 
     # Seleccionamos el experimento donde se van a agrupar todos los runs
     mlflow.set_experiment('ml_pipeline_oil_and_gas')
 
-    with mlflow.start_run(run_name = run_name): # Abrimos un nuevo run con ese nombre
-        mlflow.log_param('target', results['target']) # Logueamos manualmente el target para filtrar en la UI
-        mlflow.log_params(results['model_params']) # Logueamos los hiperparámetros del experimento
-        mlflow.log_metric('mae', mae) # Métricas de evaluación
+    with mlflow.start_run(run_name = run_name):
+        mlflow.log_param('target', results['target'])
+        mlflow.log_param('n_chunks', results['n_chunks'])
+        mlflow.log_params(results['model_params'])  # incluye n_estimators_per_chunk y _total
+        mlflow.log_metric('mae', mae)
         mlflow.log_metric('mse', mse)
         mlflow.log_metric('rmse', rmse)
         mlflow.log_metric('r2', r2)
-        # Registramos el modelo con un nombre para poder cargarlo después desde la API
-        # Cada run crea una nueva versión del modelo registrado
-        mlflow.sklearn.log_model(loaded_model, "model", registered_model_name = f"oil_gas_{results['target']}")
+        # Registramos el modelo con formato .ubj nativo (más portable que pickle entre versiones).
+        # mlflow.xgboost guarda el booster en formato JSON/UBJ y preserva metadata específica
+        # de XGBoost (incluyendo soporte para enable_categorical=True si se migra a ese esquema).
+        mlflow.xgboost.log_model(
+            loaded_model,
+            name = "model",
+            model_format = "ubj",
+            registered_model_name = f"oil_gas_{results['target']}",
+        )
 
-        # Agregamos tags y descripción a la versión recién creada para que el Model Registry sea legible
+        # Tags y descripción en el Model Registry para que sea legible sin abrir cada run
         client = MlflowClient()
         run_id = mlflow.active_run().info.run_id
         versions = client.search_model_versions(f"run_id='{run_id}'")
         if versions:
             model_name = f"oil_gas_{results['target']}"
             version = versions[0].version
-            feat_label = 'all' if len(results['features']) > 3 else 'reduced'
-            depth_label = str(results['model_params'].get('max_depth', 'None'))
 
             client.set_model_version_tag(model_name, version, 'run_name', run_name)
-            client.set_model_version_tag(model_name, version, 'n_estimators', str(results['model_params']['n_estimators']))
+            client.set_model_version_tag(model_name, version, 'n_estimators_per_chunk', str(n_estimators_pc))
+            client.set_model_version_tag(model_name, version, 'n_estimators_total', str(n_estimators_total))
             client.set_model_version_tag(model_name, version, 'max_depth', depth_label)
+            client.set_model_version_tag(model_name, version, 'learning_rate', str(results['model_params'].get('learning_rate', 'default')))
             client.set_model_version_tag(model_name, version, 'features', feat_label)
             client.set_model_version_tag(model_name, version, 'r2', f"{r2:.4f}")
 
             client.update_model_version(
                 name = model_name,
                 version = version,
-                description = f"RandomForest | n_estimators={results['model_params']['n_estimators']} | max_depth={depth_label} | features={feat_label} | R²={r2:.4f} | RMSE={rmse:.2f}"
+                description = f"XGBoost incremental | {n_estimators_pc} árboles/chunk × {results['n_chunks']} chunks = {n_estimators_total} árboles | max_depth={depth_label} | features={feat_label} | R²={r2:.4f} | RMSE={rmse:.2f}"
             )
 
-            # Descripción a nivel del modelo registrado (se sobreescribe en cada run, pero el contenido es estático)
+            # Descripción a nivel del modelo registrado (estática)
             fluid = 'petróleo' if results['target'] == 'prod_pet' else 'gas'
             feat_list = ', '.join(results['features'])
             client.update_registered_model(
                 name = model_name,
-                description = f"Predice producción mensual de {fluid} (m³) por pozo. Entrenado con RandomForestRegressor sobre datos del MINEM (producción no convencional). Features: {feat_list}."
+                description = f"Predice producción mensual de {fluid} (m³) por pozo. Entrenado con XGBoost incremental por chunks mensuales sobre datos del MINEM (producción no convencional). Features: {feat_list}."
             )
 
         return {"target": results['target'], "run_id": run_id}
@@ -492,7 +561,7 @@ def ml_pipeline():
     """
     import logging
     import mlflow
-    import mlflow.sklearn
+    import mlflow.xgboost
     from mlflow.tracking import MlflowClient
     from evidently.report import Report
     from evidently.metric_preset import RegressionPreset, DataDriftPreset
@@ -514,9 +583,10 @@ def ml_pipeline():
     for target in ['prod_gas', 'prod_pet']:
         model_name = f"oil_gas_{target}"
 
-        # Cargamos el modelo promovido a producción y leemos sus features
-        # feature_names_in_ está disponible en sklearn 1.0+ y refleja las columnas usadas en fit
-        loaded_model = mlflow.sklearn.load_model(f"models:/{model_name}@production")
+        # Cargamos el modelo promovido a producción y leemos sus features.
+        # XGBRegressor (sklearn API) expone feature_names_in_ vía property que delega
+        # al booster — funciona igual que con sklearn estimators.
+        loaded_model = mlflow.xgboost.load_model(f"models:/{model_name}@production")
         features = list(loaded_model.feature_names_in_)
 
         # Leemos splits restringidos a las features del modelo
