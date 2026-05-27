@@ -748,6 +748,31 @@ Conviene aclarar que **el proyecto sí implementa continual learning, pero a la 
 
 La slide 50 de la clase plantea exactamente este trade-off: "si un modelo XGBoost estático alcanza 86 % y la variante en streaming logra 88 %, el impacto de negocio de ese +2 % debe justificar el aumento de infraestructura". En este caso, ese +2 % no compensa el orden de magnitud de complejidad operativa que sumaría streaming. La conclusión coincide con la slide 51 de la clase: continual learning aplica para "motores publicitarios, pricing dinámico, mercados financieros, ciberseguridad" — no para predicción de producción regulatoria con cadencia mensual.
 
+### 16. Validación de schema del CSV al ingestar
+
+El pipeline asume una estructura de datos fija del CSV del MINEM. Si el gobierno cambia el nombre de una columna, reordena las columnas, o agrega un campo nuevo, el error aparece en `prepare_offline_store` (o incluso más tarde, en el entrenamiento) como un `KeyError` o un resultado incorrecto silencioso — difícil de diagnosticar.
+
+#### Solución: task `validate_dataset` antes de `prepare_offline_store`
+
+Se agregó una nueva task en el DAG que actúa como **contrato explícito entre la fuente de datos y el pipeline**. Corre inmediatamente después de `download_dataset` y antes de cualquier procesamiento:
+
+1. **Columnas requeridas**: verifica que las 9 columnas que el pipeline consume (`idpozo`, `anio`, `mes`, `prod_gas`, `prod_pet`, `tipoextraccion`, `profundidad`, `tef`, `prod_agua`) estén presentes. Si falta alguna, el DAG falla aquí con la lista exacta de columnas faltantes.
+2. **Columnas críticas no vacías**: verifica que `idpozo`, `prod_gas`, `prod_pet`, `anio` y `mes` no estén completamente vacías en la muestra inicial.
+3. **Rango de años razonable**: verifica que los valores de `anio` caigan entre 2010 y 2030. Detecta datos corruptos o columnas reordenadas que hacen que un campo numérico distinto sea interpretado como año.
+4. **Mínimo de filas**: cuenta las líneas del archivo completo por streaming (sin cargarlo en RAM) y verifica que haya al menos 100 filas. Detecta descargas incompletas.
+
+#### Por qué chequeo manual en lugar de pandera
+
+El roadmap original (#14) proponía usar `pandera`. Se optó por validación manual con pandas porque:
+
+- No agrega dependencias externas al `_PIP_ADDITIONAL_REQUIREMENTS` del DAG (el container worker ya tiene huella alta por Evidently + MLflow).
+- Las validaciones necesarias son simples (presencia de columnas, rangos, no-nulos): no requieren la expresividad de un framework de contratos.
+- Consistente con el criterio de complejidad mínima aplicado en otras decisiones del pipeline (Decisión #7, Decisión #8).
+
+#### Impacto en el flujo
+
+El task es no-destructivo: si todas las validaciones pasan, devuelve el mismo `csv_path` sin modificar el archivo. El resto del DAG continúa exactamente igual. Si alguna falla, el pipeline aborta con un `ValueError` descriptivo antes de que cualquier dato corrupto llegue al feature store o al modelo.
+
 ---
 
 ## Feature Store
