@@ -79,9 +79,11 @@ MLFlow
     ├── Experiment tracking     → métricas y artefactos por experimento
     └── Model Registry          → versiones y alias de producción
 
-API REST (FastAPI)
+API REST (FastAPI + Ray Serve)
     ├── GET /api/v1/forecast    → pronóstico de producción de un pozo (gas o petróleo)
-    └── GET /api/v1/wells       → listado de pozos disponibles
+    ├── GET /api/v1/wells       → listado de pozos disponibles
+    ├── GET /health/live        → liveness probe (proceso en pie)
+    └── GET /health/ready       → readiness probe (modelos cargados + parquet en disco)
 ```
 
 ---
@@ -772,6 +774,30 @@ El roadmap original (#14) proponía usar `pandera`. Se optó por validación man
 #### Impacto en el flujo
 
 El task es no-destructivo: si todas las validaciones pasan, devuelve el mismo `csv_path` sin modificar el archivo. El resto del DAG continúa exactamente igual. Si alguna falla, el pipeline aborta con un `ValueError` descriptivo antes de que cualquier dato corrupto llegue al feature store o al modelo.
+
+### 17. Health checks: `/health/live` y `/health/ready`
+
+En sistemas con múltiples réplicas (Ray Serve con `num_replicas=2`) y orquestadores (Docker, Kubernetes), es necesario que la infraestructura sepa si una réplica está viva y si está lista para recibir tráfico. Sin estos endpoints, un contenedor recién iniciado que todavía está cargando los modelos desde MLFlow puede recibir requests y devolver errores 500 en lugar de hacer que el load balancer espere.
+
+#### Dos probes con propósitos distintos
+
+| Endpoint | Nombre | Cuándo devuelve 200 | Cuándo devuelve error |
+|---|---|---|---|
+| `GET /health/live` | Liveness | Siempre que el proceso esté corriendo | Nunca (si llega la request, está vivo) |
+| `GET /health/ready` | Readiness | Modelos cargados + parquet en disco | 503 si alguna condición falla |
+
+**Liveness** responde la pregunta "¿está el proceso en pie?". El orquestador lo usa para decidir si reiniciar el contenedor. No verifica el estado de los modelos — verificar eso en el liveness probe causaría reinicios innecesarios si MLFlow está lento al cargar.
+
+**Readiness** responde "¿puede esta réplica servir predicciones ahora mismo?". Verifica dos condiciones concretas:
+1. `model_gas` y `model_pet` no son `None` (cargados en `__init__`)
+2. El parquet del offline store existe en el path configurado (necesario para `/api/v1/forecast` con fechas históricas)
+
+Si alguna falla, devuelve HTTP 503 con el detalle del problema en el body. Esto le permite al load balancer desviar el tráfico a la otra réplica mientras esta termina de inicializarse.
+
+#### Por qué no se implementó fallback al modelo en disco
+
+El issue original (#42) también proponía un fallback al modelo cacheado en disco si MLFlow no responde. Se decidió no implementarlo en esta iteración porque: (a) en el entorno local con Docker Compose MLFlow y la API están en la misma red y la falla de MLFlow es infrecuente, (b) el fallback introduce complejidad de coherencia (¿qué versión es la cacheada?) que no se justifica sin evidencia de que MLFlow sea un bottleneck. Se registra como mejora futura.
+
 
 ---
 
