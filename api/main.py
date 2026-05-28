@@ -5,6 +5,7 @@ import mlflow.xgboost
 import pandas as pd
 import os
 import time
+from datetime import datetime, timezone
 
 # -------------------- CONFIGURACIÓN --------------------
 
@@ -44,6 +45,9 @@ class APIDeployment:
 
         # Feature store client también reutilizable entre requests
         self.store = FeatureStore(repo_path = FEATURE_STORE_REPO)
+
+        # Timestamp de carga de modelos — expuesto por /health/ready para diagnóstico
+        self._loaded_at = datetime.now(timezone.utc).isoformat()
 
     # -------------------- ENDPOINTS --------------------
 
@@ -177,6 +181,61 @@ class APIDeployment:
             raise
         except Exception as e:
             raise HTTPException(status_code = 500, detail = str(e))
+
+
+    # -------------------- HEALTH CHECKS --------------------
+
+    @app.get("/health/live")
+    def health_live(self):
+        """
+        Liveness probe: indica si el servidor está corriendo.
+
+        Devuelve 200 siempre que el proceso esté en pie.
+        Usado por Docker / orquestadores para decidir si reiniciar el contenedor.
+        No verifica el estado de los modelos — para eso está /health/ready.
+
+        Ver Decisión #17 en el README.
+        """
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def health_ready(self):
+        """
+        Readiness probe: indica si la réplica está lista para servir predicciones.
+
+        Verifica dos condiciones:
+        - Los modelos de gas y petróleo están cargados en memoria (no None).
+        - El parquet del offline store existe en disco (necesario para /api/v1/forecast).
+
+        Devuelve 200 con metadata de diagnóstico si todo está OK.
+        Devuelve 503 si alguna condición falla, con el detalle del problema.
+
+        Usado por load balancers y orquestadores para no enviar tráfico a una
+        réplica que todavía está inicializando o que perdió acceso al feature store.
+
+        Ver Decisión #17 en el README.
+        """
+        issues = []
+
+        if self.model_gas is None:
+            issues.append("model_gas no cargado")
+        if self.model_pet is None:
+            issues.append("model_pet no cargado")
+        if not os.path.exists(PARQUET_PATH):
+            issues.append(f"parquet no encontrado en {PARQUET_PATH}")
+
+        if issues:
+            raise HTTPException(
+                status_code = 503,
+                detail = {"status": "not_ready", "issues": issues}
+            )
+
+        return {
+            "status":     "ready",
+            "models":     ["oil_gas_prod_gas@production", "oil_gas_prod_pet@production"],
+            "loaded_at":  self._loaded_at,
+            "parquet_ok": True,
+        }
 
 
 # Entry point para `serve run api.main:app_deployment`
