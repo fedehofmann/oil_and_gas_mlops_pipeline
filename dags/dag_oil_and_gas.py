@@ -87,6 +87,91 @@ def ml_pipeline():
     return save_path
 
   @task
+  def validate_dataset(csv_path):
+    """
+    Valida el schema y calidad básica del CSV descargado antes de procesarlo.
+
+    Actúa como contrato explícito entre la fuente de datos (MINEM) y el pipeline:
+    si el CSV cambia de estructura, falla aquí con un mensaje claro en lugar de
+    producir un error críptico en prepare_offline_store o durante el entrenamiento.
+
+    Verifica:
+    - Que las columnas requeridas por el pipeline existan.
+    - Que las columnas críticas no estén completamente vacías.
+    - Que el rango de años sea razonable (detecta datos corruptos o columnas reordenadas).
+    - Que el archivo tenga un mínimo de filas (detecta descargas incompletas).
+
+    No carga el CSV completo en memoria: usa pd.read_csv con nrows para el
+    chequeo de schema y un conteo de líneas por streaming para el chequeo de volumen.
+
+    Args: csv_path (str) - ruta al CSV descargado por download_dataset.
+    Retorna: csv_path sin modificar (para encadenar con prepare_offline_store).
+    Raises: ValueError si alguna validación falla.
+
+    Ver Decisión #16 en el README.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    REQUIRED_COLUMNS = {'idpozo', 'anio', 'mes', 'prod_pet', 'prod_gas', 'tipoextraccion', 'profundidad', 'tef', 'prod_agua'}
+    CRITICAL_COLUMNS = {'idpozo', 'prod_gas', 'prod_pet', 'anio', 'mes'}
+    MIN_ROWS        = 100
+    YEAR_MIN        = 2010
+    YEAR_MAX        = 2030
+
+    # Leemos solo las primeras 1000 filas para el chequeo de schema y valores.
+    # No hace falta ver el dataset completo para validar estructura y rango de años.
+    df_sample = pd.read_csv(csv_path, nrows=1000)
+
+    # 1. Columnas requeridas
+    missing = REQUIRED_COLUMNS - set(df_sample.columns)
+    if missing:
+      raise ValueError(
+        f"validate_dataset: columnas faltantes en el CSV: {sorted(missing)}. "
+        f"Columnas presentes: {list(df_sample.columns)}. "
+        f"¿Cambió la estructura del archivo del MINEM?"
+      )
+    log.info(f"validate_dataset: ✓ columnas requeridas presentes ({len(REQUIRED_COLUMNS)} columnas)")
+
+    # 2. Columnas críticas no completamente vacías
+    for col in CRITICAL_COLUMNS:
+      if df_sample[col].isna().all():
+        raise ValueError(
+          f"validate_dataset: columna crítica '{col}' está completamente vacía en el CSV. "
+          f"Revisar la fuente de datos del MINEM."
+        )
+    log.info(f"validate_dataset: ✓ columnas críticas con datos en las primeras {len(df_sample)} filas")
+
+    # 3. Rango de años razonable (detecta datos corruptos o columnas reordenadas)
+    years = df_sample['anio'].dropna()
+    if len(years) > 0:
+      year_min_found = int(years.min())
+      year_max_found = int(years.max())
+      if year_min_found < YEAR_MIN or year_max_found > YEAR_MAX:
+        raise ValueError(
+          f"validate_dataset: rango de años fuera de lo esperado: [{year_min_found}, {year_max_found}]. "
+          f"Rango válido: [{YEAR_MIN}, {YEAR_MAX}]. "
+          f"¿Datos corruptos o columnas reordenadas en el CSV?"
+        )
+      log.info(f"validate_dataset: ✓ rango de años válido [{year_min_found}, {year_max_found}]")
+
+    # 4. Mínimo de filas en el archivo completo (detecta descargas incompletas).
+    # Contamos líneas por streaming para no cargar el CSV entero en RAM.
+    with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
+      row_count = sum(1 for _ in f) - 1  # -1 por el header
+
+    if row_count < MIN_ROWS:
+      raise ValueError(
+        f"validate_dataset: el CSV tiene solo {row_count} filas (mínimo esperado: {MIN_ROWS}). "
+        f"¿Descarga incompleta o URL del MINEM cambiada?"
+      )
+    log.info(f"validate_dataset: ✓ {row_count:,} filas totales en el CSV")
+
+    log.info("validate_dataset: todas las validaciones pasaron. Pipeline listo para continuar.")
+    return csv_path
+
+  @task
   def prepare_offline_store(read_csv_path, feature_store_repo, **context):
     """
     Lee el CSV, calcula los features de ventana para cada pozo y mes, y genera el offline store.
@@ -705,9 +790,12 @@ def ml_pipeline():
       save_path = '/opt/airflow/data/pozos.csv'
   )
 
+  # Validamos schema y calidad básica del CSV antes de procesarlo (cierra #14)
+  validated_csv = validate_dataset(csv_path)
+
   # Preparamos el offline store y registramos en Feast
   offline_store = prepare_offline_store(
-      read_csv_path = csv_path,
+      read_csv_path = validated_csv,
       feature_store_repo = FEATURE_STORE_REPO
   )
 
@@ -722,7 +810,7 @@ def ml_pipeline():
   )
 
   # Definimos dependencias iniciales
-  start >> csv_path >> offline_store >> online_store >> splits
+  start >> csv_path >> validated_csv >> offline_store >> online_store >> splits
 
   # Loop sobre los experimentos encadenados en serie
   prev_task = splits

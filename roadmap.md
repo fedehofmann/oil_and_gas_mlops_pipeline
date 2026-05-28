@@ -12,7 +12,8 @@
 | ✅ Mergeado | #29 Ray Serve (cubre #6 obligatorio) | 2026-04-30 | `num_replicas=2` unificado |
 | ✅ Mergeado | #25 Filtro automático COVID | 2026-04-30 | Default `exclude_years=[2020]` |
 | ✅ Mergeado | #31 Evidently AI (consolida #7+#8+#30 obligatorios) | 2026-05-01 | Mergeado en PR #35. Cubre obligatorio del RFC con R² delta + drift_share via PSI |
-| 🔄 En review | Incremental learning XGBoost (#36) | 2026-05-07 | PR #37 abierto. Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
+| ✅ Mergeado | Incremental learning XGBoost (#36) | 2026-05-27 | PR #37 mergeado. Migración RandomForest → XGBoost con training incremental en chunks mensuales. R² del modelo en producción: gas 0.869 / pet 0.895 (validado end-to-end). Resuelve OOM estructural y habilita entrenar con histórico completo. |
+| ✅ Mergeado | #14 Validación de schema CSV | 2026-05-27 | Task `validate_dataset` entre `download_dataset` y `prepare_offline_store`. Valida columnas requeridas, campos críticos no vacíos, rango de años y mínimo de filas. Falla con mensaje claro antes de que datos corruptos lleguen al feature store. Decisión #16 en README. |
 **Pendientes consolidados en el [Backlog priorizado](#backlog-priorizado) más abajo** — incluye los issues del roadmap original (#9, #10, #11, #13, #14, #15, #16, #17, #18) y los detectados durante reviews de las clases 6, 7 y 8 (#26, #27, #28, #38, #39, #40-44, #46-48).
 
 **Notas sobre la evolución del scope:**
@@ -39,7 +40,7 @@ Criterio de los niveles:
 |---|---|---|
 | **P1** | [#46](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/46) Alerta de modelo stale | Detecta DAG fallando silenciosamente. Endpoint `/health/staleness` o tarea Airflow independiente. Origen: Clase 7, Caso 1 YarnIt. |
 | **P1** | [#47](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/47) Validación de outputs (NaN / rangos físicos) | Defensivo. Evita devolver predicciones absurdas (negativas, NaN) al consumidor. Origen: Clase 7, slide 62. |
-| **P1** | [#14](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/14) Validación de schema CSV con pandera | Detecta cambios upstream en el dataset MINEM antes de romper en una tarea posterior. Origen: roadmap original. |
+| ✅ **Cerrado** | [#14](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/14) Validación de schema CSV | Implementado en task `validate_dataset` (2026-05-27). Validación manual con pandas: columnas requeridas, campos críticos no vacíos, rango de años, mínimo de filas. Decisión #16 en README. |
 | **P1** | [#42](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/42) Health check + graceful degradation | Endpoints `/health/live` y `/health/ready` + fallback al modelo cacheado en disco. Origen: Clase 6, slides 36 y 52. |
 | **P1** | [#41](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/41) Autenticación API key | Hoy `/api/v1/*` están abiertos. Mínimo: `X-API-Key` validado contra `.env`. Origen: Clase 6, slide 52. |
 | **P2** | [#40](https://github.com/fedehofmann/oil_and_gas_mlops_pipeline/issues/40) Métricas de latencia P50/P90/P99 | Prerrequisito para definir SLA y para validar #27/#28. Origen: Clase 6, slides 7, 27, 52. |
