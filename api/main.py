@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from feast import FeatureStore
 from ray import serve
 import mlflow.xgboost
@@ -51,11 +51,26 @@ class APIDeployment:
 
     # -------------------- ENDPOINTS --------------------
 
-    @app.get("/api/v1/wells")
-    def get_wells(self, date_query: str):
+    @app.get(
+        "/api/v1/wells",
+        summary = "Listado de pozos disponibles para una fecha",
+        responses = {
+            200: {"description": "Lista de pozos con registros en esa fecha"},
+            404: {"description": "No hay pozos para la fecha indicada"},
+            500: {"description": "Error interno del servidor"},
+        },
+    )
+    def get_wells(
+        self,
+        date_query: str = Query(
+            ...,
+            description = "Primer día del mes a consultar, en formato YYYY-MM-DD.",
+            example = "2023-01-01",
+        ),
+    ):
         """
         Devuelve el listado de pozos que tienen registros para la fecha dada.
-        La fecha debe ser el primer día del mes (ej: 2022-01-01).
+        La fecha debe ser el primer día del mes (ej: 2023-01-01).
         """
         try:
             # Leemos el parquet del offline store (una fila por pozo por mes)
@@ -76,14 +91,44 @@ class APIDeployment:
         except Exception as e:
             raise HTTPException(status_code = 500, detail = str(e))
 
-    @app.get("/api/v1/forecast")
-    def get_forecast(self, id_well: str, date_start: str, date_end: str, target: str = "gas"):
+    @app.get(
+        "/api/v1/forecast",
+        summary = "Pronóstico de producción mensual de un pozo",
+        responses = {
+            200: {"description": "Lista de predicciones mensuales para el rango solicitado"},
+            400: {"description": "Parámetros inválidos (target, rango de fechas, o fecha anterior al histórico)"},
+            404: {"description": "Pozo no encontrado o sin features en el online store"},
+            500: {"description": "Error interno del servidor"},
+        },
+    )
+    def get_forecast(
+        self,
+        id_well: str = Query(
+            ...,
+            description = "Identificador numérico del pozo (campo `idpozo` del dataset del MINEM).",
+            example = "13640",
+        ),
+        date_start: str = Query(
+            ...,
+            description = "Primer mes del rango de pronóstico, en formato YYYY-MM-DD. Debe ser el primer día del mes.",
+            example = "2023-01-01",
+        ),
+        date_end: str = Query(
+            ...,
+            description = "Último mes del rango de pronóstico, en formato YYYY-MM-DD. Debe ser el primer día del mes.",
+            example = "2023-06-01",
+        ),
+        target: str = Query(
+            "gas",
+            description = "Fluido a predecir. Valores válidos: 'gas' (m³/mes) o 'pet' (petróleo, m³/mes).",
+            example = "gas",
+        ),
+    ):
         """
-        Devuelve el pronóstico de producción de un pozo para cada mes entre date_start y date_end.
+        Devuelve el pronóstico de producción mensual de un pozo para cada mes entre date_start y date_end.
 
-            - Para fechas históricas con datos reales usa los features del offline store (parquet).
-
-            - Para fechas futuras o la fila futura del parquet (target nulo) usa el online store.
+        - Para fechas históricas con datos reales usa los features del offline store (parquet).
+        - Para fechas futuras usa el online store (features más recientes del pozo).
 
         No se hace actualización autoregresiva para evitar distribution shift en avg_prod_10m.
         """
